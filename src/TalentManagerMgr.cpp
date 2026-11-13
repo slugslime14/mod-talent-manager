@@ -85,8 +85,6 @@ namespace TalentManager
         std::lock_guard<std::mutex> guard(_lock);
         uint32 const guid = player->GetGUID().GetCounter();
         _profiles.erase(guid);
-        if (_swaps.erase(guid))
-            _swapCount = uint32(_swaps.size());
     }
 
     void Mgr::OnDeleteFromDB(CharacterDatabaseTransaction trans, uint32 guid)
@@ -256,8 +254,6 @@ namespace TalentManager
             HandleDelete(player, payload);
         else if (command == "LOAD")
             HandleLoad(player, payload);
-        else if (command == "STOP")
-            CancelSwap(player, "stopped");
         else if (command == "GLYPHS")
             SendGlyphs(player);
         else if (command == "CHARS")
@@ -274,12 +270,12 @@ namespace TalentManager
         }
     }
 
-    // INFO:version,maxSpecs,swapCastMs,talentPoints,activeGroup,groupCount,level,class
+    // INFO:version,maxSpecs,talentPoints,activeGroup,groupCount,level,class
     // activeGroup is 1-based, as the client's GetActiveTalentGroup() counts.
     void Mgr::SendInfo(Player* player)
     {
-        Comms::Send(player, "INFO", Acore::StringFormat("{},{},{},{},{},{},{},{}", PROTOCOL_VERSION, Cfg().maxSpecs,
-            Cfg().swapCastTime, player->CalculateTalentsPoints(), uint32(player->GetActiveSpec()) + 1,
+        Comms::Send(player, "INFO", Acore::StringFormat("{},{},{},{},{},{},{}", PROTOCOL_VERSION, Cfg().maxSpecs,
+            player->CalculateTalentsPoints(), uint32(player->GetActiveSpec()) + 1,
             uint32(player->GetSpecsCount()), uint32(player->GetLevel()), uint32(player->getClass())));
     }
 
@@ -522,9 +518,6 @@ namespace TalentManager
             for (uint32& loaded : profile.loaded)
                 if (loaded == id)
                     loaded = 0;
-            auto swap = _swaps.find(guid);
-            if (swap != _swaps.end() && swap->second.specId == id)
-                CancelSwap(player, "deleted");
         }
         SendSpecs(player);
     }

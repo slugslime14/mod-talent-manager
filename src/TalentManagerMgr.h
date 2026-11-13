@@ -4,8 +4,8 @@
 #include "DatabaseEnvFwd.h"
 #include "Define.h"
 #include "SharedDefines.h"
+#include "TalentManagerTalents.h"
 #include <array>
-#include <atomic>
 #include <map>
 #include <mutex>
 #include <set>
@@ -19,7 +19,7 @@ class Player;
 namespace TalentManager
 {
     // Protocol version sent in INFO. The addon warns when it doesn't match its own.
-    constexpr uint32 PROTOCOL_VERSION = 5;
+    constexpr uint32 PROTOCOL_VERSION = 6;
     constexpr std::size_t MAX_NAME_LENGTH = 32;    // characters; talent_manager_spec.name is VARCHAR(32)
     constexpr uint8 GLYPH_SLOTS = MAX_GLYPH_SLOT_INDEX;
     constexpr uint8 TALENT_GROUPS = 2;              // dual spec (MAX_TALENT_SPECS)
@@ -48,18 +48,6 @@ namespace TalentManager
         std::set<uint32> known;                         // glyphs the character has had in a socket
     };
 
-    // A spec load waiting for its swap cast to finish.
-    struct Swap
-    {
-        uint32 specId = 0;
-        uint32 remaining = 0;   // ms
-        uint32 mapId = 0;
-        float x = 0.0f;
-        float y = 0.0f;
-        float z = 0.0f;
-        bool bot = false;       // an altbot's: it follows its master, so moving doesn't stop it
-    };
-
     class Mgr
     {
     public:
@@ -72,9 +60,6 @@ namespace TalentManager
         void OnLogin(Player* player);
         void OnLogout(Player* player);
         void OnDeleteFromDB(CharacterDatabaseTransaction trans, uint32 guid);
-
-        // Runs a pending swap cast: cancels it on combat, moving or death, loads the spec when it ends.
-        void OnUpdate(Player* player, uint32 diff);
 
         // `body` is "CMD:payload", the text after the TMGR envelope, or "@<guid>|CMD:payload" for one of the player's
         // altbots.
@@ -109,11 +94,8 @@ namespace TalentManager
         // TalentManagerLoad.cpp. All of these run with _lock held.
         // Why the player can't change talents now, or empty when they can.
         std::string LoadBlocker(Player* player);
-        // Why a running swap cast stops, or empty while it goes on.
-        std::string SwapInterrupt(Player* player, Swap const& swap);
-        void CancelSwap(Player* player, std::string_view reason);
-        // Checks the spec once more and puts it on the player: talents, then glyphs (action bars in phase 5).
-        void FinishLoad(Player* player, uint32 specId);
+        // Puts the spec on the player: talents, glyphs, then action bars.
+        void FinishLoad(Player* player, Spec const& spec, Talents::Build const& build);
         // Puts the spec's glyphs in their sockets. Glyphs that can't go in are added to `skipped`, glyphs inscribed
         // from an item in the bags to `used`.
         void ApplyGlyphs(Player* player, Profile& profile, Spec const& spec, std::vector<uint32>& skipped,
@@ -134,12 +116,10 @@ namespace TalentManager
 
         void SaveSpec(Player* player, Spec const& spec);
 
-        // Addon messages arrive on the world thread, swap casts finish in map update threads (several run at once),
-        // so everything below is used under _lock.
+        // Addon messages and the login, logout and delete hooks may not all run on one thread, so the profiles are
+        // used under _lock.
         std::mutex _lock;
         std::unordered_map<uint32, Profile> _profiles;  // by character guid (low)
-        std::unordered_map<uint32, Swap> _swaps;        // by character guid (low)
-        std::atomic<uint32> _swapCount{0};              // _swaps.size(), read without the lock on every player update
     };
 }
 

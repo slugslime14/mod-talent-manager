@@ -127,11 +127,13 @@ namespace TalentManager::Talents
                     return false;
                 }
 
-                // The prerequisite needs DependsOnRank + 1 points, as Player::LearnTalent checks.
+                // The prerequisite needs DependsOnRank + 1 points, as Player::LearnTalent checks. A prerequisite that
+                // isn't in Talent.dbc is ignored, as the core and the client do: 3.3.5's Sanctified Seals (1756) still
+                // names the removed talent 1409, and a Death Knight talent (1993) the removed 1994.
                 if (tree[i]->DependsOn)
                 {
                     int32 const dep = IndexOf(tree, tree[i]->DependsOn);
-                    if (dep < 0 || build[t][dep] < tree[i]->DependsOnRank + 1)
+                    if (dep >= 0 && build[t][dep] < tree[i]->DependsOnRank + 1)
                     {
                         error = Acore::StringFormat("a talent in row {} of tree {} is missing its prerequisite",
                             tree[i]->Row + 1, t + 1);

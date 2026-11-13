@@ -1,5 +1,5 @@
 -- TalentManager Glyphs tab: the build's six glyph sockets drawn like the stock 3.3.5 glyph frame (Blizzard_GlyphUI's
--- art, socket positions and textures), and under it the class's glyphs to pick from for the selected socket.
+-- art, socket positions and textures). Clicking a socket opens a list of the class's glyphs for it beside the socket.
 -- Sockets are numbered as GetGlyphSocketInfo counts them: 1, 4 and 6 major, 2, 3 and 5 minor.
 
 local TM = TalentManager
@@ -36,13 +36,23 @@ local SOCKET_POINTS = {
     [6] = { "BOTTOMLEFT", 26, 168 },
 }
 
-local LIST_TOP = 446         -- the glyph list starts under the art (441 high)
-local LIST_BOTTOM = 134      -- and ends above the points bar
+-- The glyph list popup: where it opens beside each socket (point on the list, point on the socket, x, y).
+local LIST_POINTS = {
+    [1] = { "TOP", "BOTTOM", 0, 6 },
+    [2] = { "BOTTOM", "TOP", 0, -6 },
+    [3] = { "LEFT", "RIGHT", -6, 0 },
+    [6] = { "LEFT", "RIGHT", -6, 0 },
+    [4] = { "RIGHT", "LEFT", 6, 0 },
+    [5] = { "RIGHT", "LEFT", 6, 0 },
+}
+local LIST_WIDTH = 250
+local LIST_ROWS = 12
+local LIST_INSET = 8
 local ROW_HEIGHT = 22
-local HEADER_HEIGHT = 20
+local HEADER_HEIGHT = 22
 
 local pane, list
-local selectedSocket
+local selectedSocket        -- the socket the list is open for, or nil when it is closed
 local listOffset = 0
 
 local function Texture(parent, layer, file, width, height)
@@ -124,10 +134,10 @@ local function SocketTooltip(socket)
     elseif glyph then
         GameTooltip:SetHyperlink("spell:" .. glyph.spellId)
         AddStateLine(glyph)
-        GameTooltip:AddLine("Click to pick another from the list, right-click to take it out.", 0.5, 0.5, 0.5, true)
+        GameTooltip:AddLine("Click to pick another, right-click to take it out.", 0.5, 0.5, 0.5, true)
     else
         GameTooltip:SetText(typeName)
-        GameTooltip:AddLine("Empty. Click to pick a glyph from the list below.", 1, 1, 1, true)
+        GameTooltip:AddLine("Empty. Click to pick a glyph.", 1, 1, 1, true)
         GameTooltip:AddLine("Loading a spec with an empty socket leaves the glyph you have there.", 0.5, 0.5, 0.5,
             true)
     end
@@ -172,7 +182,7 @@ local function UpdateSocket(socket)
         end
     end
 
-    if enabled and id == selectedSocket then
+    if enabled and id == selectedSocket and list:IsShown() then
         socket.highlight:SetAlpha(0.6)
         socket.highlight:Show()
     elseif socket:IsMouseOver() and enabled then
@@ -187,6 +197,19 @@ local function UpdateSocket(socket)
     end
 end
 
+local function OpenList(id)
+    selectedSocket = id
+    listOffset = 0
+    local point = LIST_POINTS[id]
+    list:ClearAllPoints()
+    list:SetPoint(point[1], pane.sockets[id], point[2], point[3], point[4])
+end
+
+local function CloseList()
+    selectedSocket = nil
+end
+
+-- Click opens the list for the socket (or closes it when it is open for that socket); right-click empties it.
 local function SocketClicked(socket, button)
     local id = socket:GetID()
     if not TM:SocketInfo(id) then
@@ -194,10 +217,11 @@ local function SocketClicked(socket, button)
     end
     if button == "RightButton" then
         TM:SetGlyph(id, 0)
-    end
-    if selectedSocket ~= id then
-        selectedSocket = id
-        listOffset = 0
+        CloseList()
+    elseif selectedSocket == id then
+        CloseList()
+    else
+        OpenList(id)
     end
     Pane:Update()
 end
@@ -244,7 +268,7 @@ local STATE_ORDER = { known = 1, bags = 2, none = 3 }
 -- The class's glyphs for the selected socket's type: known first, then in the bags, then the rest.
 local function ListedGlyphs()
     local glyphs = {}
-    local _, glyphType = TM:SocketInfo(selectedSocket or 1)
+    local _, glyphType = TM:SocketInfo(selectedSocket)
     for _, glyph in ipairs(TM.glyphs or {}) do
         if glyph.type == glyphType then
             glyphs[#glyphs + 1] = glyph
@@ -283,15 +307,18 @@ end
 
 local function RowClicked(row)
     if row.glyph and selectedSocket and TM:SocketInfo(selectedSocket) then
-        TM:SetGlyph(selectedSocket, row.glyph.id)
+        local socket = selectedSocket
+        CloseList()
+        TM:SetGlyph(socket, row.glyph.id)
+        Pane:Update()
     end
 end
 
 local function BuildRow(index)
     local row = CreateFrame("Button", nil, list)
     row:SetHeight(ROW_HEIGHT)
-    row:SetPoint("TOPLEFT", list, "TOPLEFT", 0, -HEADER_HEIGHT - (index - 1) * ROW_HEIGHT)
-    row:SetPoint("RIGHT", list, "RIGHT")
+    row:SetPoint("TOPLEFT", list, "TOPLEFT", LIST_INSET, -LIST_INSET - HEADER_HEIGHT - (index - 1) * ROW_HEIGHT)
+    row:SetPoint("RIGHT", list, "RIGHT", -LIST_INSET, 0)
     row:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
 
     row.icon = row:CreateTexture(nil, "ARTWORK")
@@ -362,20 +389,17 @@ local function VisibleRows()
 end
 
 local function UpdateList()
-    local enabled, glyphType = TM:SocketInfo(selectedSocket or 1)
+    local _, glyphType = TM:SocketInfo(selectedSocket)
     local glyphs = ListedGlyphs()
     local rows = VisibleRows()
     listOffset = math.max(0, math.min(listOffset, #glyphs - rows))
 
     if not TM.glyphs then
         list.header:SetText(TM.info and "Waiting for the glyph list..." or "The server didn't send a glyph list.")
-    elseif not selectedSocket or not enabled then
-        list.header:SetText(("Glyph sockets open at level %d."):format(TM.SOCKET_LEVELS[1]))
-        glyphs = {}
     else
         local typeName = glyphType == MINOR and "Minor glyphs" or "Major glyphs"
         if #glyphs > rows then
-            list.header:SetText(("%s (%d-%d of %d, scroll for more)"):format(typeName, listOffset + 1,
+            list.header:SetText(("%s %d-%d of %d (scroll)"):format(typeName, listOffset + 1,
                 math.min(listOffset + rows, #glyphs), #glyphs))
         else
             list.header:SetText(typeName)
@@ -420,10 +444,29 @@ function Pane:Build(f)
         pane.sockets[id] = BuildSocket(pane, id)
     end
 
-    list = CreateFrame("Frame", NAME .. "List", f)
-    list:SetPoint("TOPLEFT", f, "TOPLEFT", 24, -LIST_TOP)
-    list:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -40, LIST_BOTTOM)
-    list:SetFrameLevel(pane:GetFrameLevel())
+    -- The window's bottom bars (Clear, Save, Reset and the points line) stay usable above the art.
+    for _, bar in ipairs({ "PreviewBar", "PointsBar" }) do
+        local frame = _G[f:GetName() .. bar]
+        if frame then
+            frame:SetFrameLevel(pane:GetFrameLevel() + 2)
+        end
+    end
+
+    -- The glyph list: a popup beside the socket it is open for.
+    list = CreateFrame("Frame", NAME .. "List", pane)
+    list:SetWidth(LIST_WIDTH)
+    list:SetHeight(2 * LIST_INSET + HEADER_HEIGHT + LIST_ROWS * ROW_HEIGHT)
+    list:SetFrameLevel(pane:GetFrameLevel() + 6)
+    list:SetClampedToScreen(true)
+    list:SetBackdrop({
+        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = true, tileSize = 16, edgeSize = 16,
+        insets = { left = 4, right = 4, top = 4, bottom = 4 },
+    })
+    list:SetBackdropColor(0, 0, 0, 0.95)
+    list:SetBackdropBorderColor(1, 1, 1)
+    list:EnableMouse(true)
     list:EnableMouseWheel(true)
     list:SetScript("OnMouseWheel", function(_, delta)
         listOffset = listOffset - delta * 3
@@ -431,24 +474,23 @@ function Pane:Build(f)
     end)
     list:Hide()
 
-    list.header = list:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    list.header:SetPoint("TOPLEFT", 4, -4)
-    list.header:SetPoint("RIGHT", -4, 0)
+    local close = CreateFrame("Button", nil, list, "UIPanelCloseButton")
+    close:SetWidth(24)
+    close:SetHeight(24)
+    close:SetPoint("TOPRIGHT", list, "TOPRIGHT", -2, -2)
+    close:SetScript("OnClick", function()
+        CloseList()
+        Pane:Update()
+    end)
+
+    list.header = list:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+    list.header:SetPoint("TOPLEFT", LIST_INSET + 4, -LIST_INSET - 5)
+    list.header:SetPoint("RIGHT", close, "LEFT", -2, 0)
     list.header:SetJustifyH("LEFT")
 
     list.rows = {}
-    local height = (f:GetHeight() - LIST_TOP - LIST_BOTTOM) - HEADER_HEIGHT
-    for i = 1, math.max(1, math.floor(height / ROW_HEIGHT)) do
+    for i = 1, LIST_ROWS do
         list.rows[i] = BuildRow(i)
-    end
-end
-
--- The first socket open at your level, for a start.
-local function DefaultSocket()
-    for id = 1, TM.GLYPH_SLOTS do
-        if TM:SocketInfo(id) then
-            return id
-        end
     end
 end
 
@@ -457,15 +499,20 @@ function Pane:Update()
         return
     end
     if not UI:OnGlyphTab() or not UI.frame:IsShown() then
+        CloseList()
         pane:Hide()
-        list:Hide()
         return
     end
     pane:Show()
-    list:Show()
 
-    if not selectedSocket or not TM:SocketInfo(selectedSocket) then
-        selectedSocket = DefaultSocket()
+    -- A socket can close under the list: another character shown, or a lower level.
+    if selectedSocket and not TM:SocketInfo(selectedSocket) then
+        CloseList()
+    end
+    if selectedSocket then
+        list:Show()
+    else
+        list:Hide()
     end
 
     local draft = TM.draft
@@ -478,7 +525,9 @@ function Pane:Update()
     for _, socket in ipairs(pane.sockets) do
         UpdateSocket(socket)
     end
-    UpdateList()
+    if selectedSocket then
+        UpdateList()
+    end
 end
 
 TM:On("WINDOW", function() Pane:Update() end)

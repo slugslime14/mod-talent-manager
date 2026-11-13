@@ -143,12 +143,7 @@ local function ExportClicked()
     UI:AskLink("Talent link for " .. TM:DraftName() .. ". Press Ctrl+C to copy it.", TM:EncodeDraft(TM.draft))
 end
 
--- Load, or Stop while a load is casting.
 local function LoadClicked()
-    if TM.casting then
-        TM:StopLoad()
-        return
-    end
     local spec = ShownSpec()
     if spec then
         TM:LoadSpec(spec.id)
@@ -168,9 +163,6 @@ local function LoadBlocker()
 end
 
 local function LoadTooltip()
-    if TM.casting then
-        return "Stop loading the spec. Moving or combat stops it too."
-    end
     local blocker = LoadBlocker()
     if blocker then
         return blocker
@@ -180,11 +172,11 @@ local function LoadTooltip()
         return "Put the talents and glyphs back to " .. spec.name .. "."
     end
     if TM.char then
-        return "Put " .. spec.name .. " on " .. TM.char.name .. ", out of combat. Talents that move or come out take a "
-            .. "short cast; combat stops it. Glyphs go in with it, and the bot sets up its strategies again."
+        return "Put " .. spec.name .. " on " .. TM.char.name .. ", out of combat. Glyphs go in with it, and the bot "
+            .. "sets up its strategies again."
     end
-    return "Put " .. spec.name .. " on your character, out of combat. Talents that move or come out take a "
-        .. "short cast; moving or combat stops it. Glyphs and the spec's action bars go in with it."
+    return "Put " .. spec.name .. " on your character, out of combat. Glyphs and the spec's action bars go in "
+        .. "with it."
 end
 
 local BUTTONS = {
@@ -421,13 +413,7 @@ function Specs:Update()
     end
 
     local spec = ShownSpec()
-    if TM.casting then
-        panel.load:SetText(STOP or "Stop")
-        SetEnabled(panel.load, true)
-    else
-        panel.load:SetText("Load")
-        SetEnabled(panel.load, online and not LoadBlocker())
-    end
+    SetEnabled(panel.load, online and not LoadBlocker())
     SetEnabled(panel.useLive, online and spec ~= nil and spec == loaded and liveDiffers and not draft.dirty)
     if spec and spec == loaded then
         panel.note:SetText(liveDiffers and "The live talents or glyphs differ from this spec: Load puts them back, "
@@ -446,6 +432,4 @@ function Specs:Update()
 end
 
 TM:On("WINDOW", function() Specs:Update() end)
-TM:On("CAST", function() Specs:Update() end)
-TM:On("CASTSTOP", function() Specs:Update() end)
 TM:On("CHARACTERS", function() UpdatePicker() end)

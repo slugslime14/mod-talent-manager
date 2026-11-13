@@ -1,8 +1,8 @@
 -- TalentManager window: a talent tree that looks like the game's talent frame, drawing a draft instead of your live
--- talents. The layout numbers and textures are the 3.3.5 PlayerTalentFrame's, made tall enough to show a whole tree
--- without scrolling. Branches and arrows are placed with the stock helpers in FrameXML's TalentFrameBase.lua
--- (TalentFrame_SetPrereqs, TalentFrame_SetBranchTexture, ...), which find their textures by name, so the child
--- frames below use the names those helpers expect (the tree canvas is "<frame>ScrollChildFrame" for that reason).
+-- talents. The size, layout numbers and textures are the 3.3.5 PlayerTalentFrame's, scrolling tree included.
+-- Branches and arrows are placed with the stock helpers in FrameXML's TalentFrameBase.lua (TalentFrame_SetPrereqs,
+-- TalentFrame_SetBranchTexture, ...), which find their textures by name, so the child frames below use the names
+-- those helpers expect ("<frame>ScrollFrame", "<frame>ScrollChildFrame", ...).
 
 local TM = TalentManager
 local UI = {}
@@ -20,10 +20,12 @@ local OFFSET_Y = INITIAL_TALENT_OFFSET_Y or 20
 local SPACING = 63
 local TALENT_BUTTON_HEIGHT = 37     -- ItemButtonTemplate
 
--- The stock frame: the tree area starts 77 below the top, and the points and button bars take the bottom 129.
-local WIDTH = 384
-local TREE_LEFT, TREE_TOP, TREE_WIDTH = 23, 77, 325
+-- The stock frame: 384 x 512; the tree's scroll frame is 296 wide, 65 in from the right and 77 below the top, and
+-- ends at the points bar (the points and button bars take the bottom 129).
+local WIDTH, HEIGHT = 384, 512
+local TREE_RIGHT, TREE_TOP, TREE_WIDTH = 65, 77, 296
 local BOTTOM_BARS = 129
+local CANVAS_WIDTH = 320            -- PlayerTalentFrameScrollChildFrame
 
 local frame
 
@@ -45,29 +47,15 @@ local function Texture(parent, name, layer, file, width, height)
     return texture
 end
 
--- Height of the tree area: every row of the deepest tree, plus a margin under the last row.
-local function TreeHeight()
-    local maxTier = 1
-    for _, tree in ipairs(TM:LoadTrees()) do
-        if tree.maxTier > maxTier then
-            maxTier = tree.maxTier
-        end
-    end
-    return OFFSET_Y + (maxTier - 1) * SPACING + TALENT_BUTTON_HEIGHT + 14
+-- Height of a tree's canvas: every row, plus a margin under the last row.
+local function TreeHeight(tree)
+    return OFFSET_Y + ((tree.maxTier or 1) - 1) * SPACING + TALENT_BUTTON_HEIGHT + 14
 end
 
--- A whole tree is taller than the stock frame; on a short screen the window is scaled down to fit.
-local function FitToScreen(f)
-    local available = UIParent:GetHeight() - 24
-    f:SetScale(math.min(1, available / f:GetHeight()))
-end
-
--- The frame art, portrait, title and close button, as PlayerTalentFrame has them. The stock art is 512 high; the
--- taller window fills the gap between the top and bottom art with a thin band from the bottom of the top pieces,
--- where the art is only the side borders.
-local function BuildShell(f, height)
+-- The frame art, portrait, title and close button, as PlayerTalentFrame has them.
+local function BuildShell(f)
     f:SetWidth(WIDTH)
-    f:SetHeight(height)
+    f:SetHeight(HEIGHT)
     f:SetHitRectInsets(0, 30, 0, 45)
     f:SetToplevel(true)
     f:EnableMouse(true)
@@ -95,18 +83,6 @@ local function BuildShell(f, height)
     bottomLeft:SetPoint("BOTTOMLEFT", 2, -1)
     local bottomRight = Texture(f, nil, "BORDER", art .. "BottomRight", 128, 256)
     bottomRight:SetPoint("BOTTOMRIGHT", 2, -1)
-
-    if height > 512 then
-        local band = 0.96
-        local middleLeft = Texture(f, nil, "BORDER", art .. "TopLeft")
-        middleLeft:SetPoint("TOPLEFT", topLeft, "BOTTOMLEFT")
-        middleLeft:SetPoint("BOTTOMRIGHT", bottomLeft, "TOPRIGHT")
-        middleLeft:SetTexCoord(0, 1, band, 1)
-        local middleRight = Texture(f, nil, "BORDER", art .. "TopRight")
-        middleRight:SetPoint("TOPLEFT", topRight, "BOTTOMLEFT")
-        middleRight:SetPoint("BOTTOMRIGHT", bottomRight, "TOPRIGHT")
-        middleRight:SetTexCoord(0, 1, band, 1)
-    end
 
     f.title = f:CreateFontString(NAME .. "TitleText", "OVERLAY", "GameFontNormal")
     f.title:SetPoint("TOP", 0, -18)
@@ -290,55 +266,43 @@ local function OnTalentClick(button, mouseButton)
     end
 end
 
--- The talent background is four textures that make one 300 x 331 picture: TopLeft 256 x 256, TopRight 44 x 256
--- (from a 64 wide file), BottomLeft 256 x 75 (from a 128 high file) and BottomRight 44 x 75. The stock frame
--- shows it at that size behind a scrolling tree. Here the tree area is much taller, so the picture is zoomed evenly
--- until it fills the area and the sides that don't fit are cut off, instead of stretching it out of shape.
-local BACKGROUND_WIDTH, BACKGROUND_HEIGHT = 300, 331
-local BACKGROUND_PIECES = {
-    TopLeft = { x = 0, y = 0, w = 256, h = 256, fileW = 256, fileH = 256 },
-    TopRight = { x = 256, y = 0, w = 44, h = 256, fileW = 64, fileH = 256 },
-    BottomLeft = { x = 0, y = 256, w = 256, h = 75, fileW = 256, fileH = 128 },
-    BottomRight = { x = 256, y = 256, w = 44, h = 75, fileW = 64, fileH = 128 },
-}
-
-local function LayoutBackground(f)
-    local areaWidth, areaHeight = f.treeArea:GetWidth(), f.treeArea:GetHeight()
-    local zoom = math.max(areaWidth / BACKGROUND_WIDTH, areaHeight / BACKGROUND_HEIGHT)
-    local viewWidth, viewHeight = areaWidth / zoom, areaHeight / zoom
-    local viewX, viewY = (BACKGROUND_WIDTH - viewWidth) / 2, (BACKGROUND_HEIGHT - viewHeight) / 2
-
-    for piece, p in pairs(BACKGROUND_PIECES) do
-        local texture = f.backgrounds[piece]
-        local x0, x1 = math.max(p.x, viewX), math.min(p.x + p.w, viewX + viewWidth)
-        local y0, y1 = math.max(p.y, viewY), math.min(p.y + p.h, viewY + viewHeight)
-        if x1 <= x0 or y1 <= y0 then
-            texture:Hide()
-        else
-            texture:ClearAllPoints()
-            texture:SetPoint("TOPLEFT", f.treeArea, "TOPLEFT", (x0 - viewX) * zoom, -(y0 - viewY) * zoom)
-            texture:SetWidth((x1 - x0) * zoom)
-            texture:SetHeight((y1 - y0) * zoom)
-            texture:SetTexCoord((x0 - p.x) / p.fileW, (x1 - p.x) / p.fileW, (y0 - p.y) / p.fileH,
-                (y1 - p.y) / p.fileH)
-            texture:Show()
-        end
-    end
-end
-
--- The tree: background, talent buttons, branch and arrow textures.
-local function BuildTree(f, treeHeight)
-    local area = CreateFrame("Frame", NAME .. "TreeArea", f)
+-- The tree: a scroll frame with the talent background and the scroll bar art, as the stock frame has them, and a
+-- canvas that scrolls with the talent buttons, branch and arrow textures.
+local function BuildTree(f)
+    local area = CreateFrame("ScrollFrame", NAME .. "ScrollFrame", f, "UIPanelScrollFrameTemplate")
     area:SetWidth(TREE_WIDTH)
-    area:SetHeight(treeHeight)
-    area:SetPoint("TOPLEFT", f, "TOPLEFT", TREE_LEFT, -TREE_TOP)
+    area:SetHeight(HEIGHT - TREE_TOP - BOTTOM_BARS)
+    area:SetPoint("TOPRIGHT", f, "TOPRIGHT", -TREE_RIGHT, -TREE_TOP)
     f.treeArea = area
 
-    f.backgrounds = {}
-    for piece in pairs(BACKGROUND_PIECES) do
-        f.backgrounds[piece] = Texture(area, NAME .. "Background" .. piece, "BORDER")
-    end
-    LayoutBackground(f)
+    -- The four background pieces, anchored as PlayerTalentFrameBackground*.
+    local b = {}
+    b.TopLeft = Texture(area, NAME .. "BackgroundTopLeft", "BORDER", nil, 256, 256)
+    b.TopLeft:SetPoint("TOPLEFT")
+    b.TopLeft:SetPoint("RIGHT", -40, 0)
+    b.TopLeft:SetPoint("BOTTOM", 0, 76)
+    b.TopRight = Texture(area, NAME .. "BackgroundTopRight", "BORDER", nil, 44, 256)
+    b.TopRight:SetPoint("TOPRIGHT")
+    b.TopRight:SetPoint("BOTTOMLEFT", b.TopLeft, "BOTTOMRIGHT")
+    b.TopRight:SetTexCoord(0, 0.6875, 0, 1)
+    b.BottomLeft = Texture(area, NAME .. "BackgroundBottomLeft", "BORDER", nil, 256, 75)
+    b.BottomLeft:SetPoint("BOTTOMLEFT")
+    b.BottomLeft:SetPoint("TOPRIGHT", b.TopLeft, "BOTTOMRIGHT")
+    b.BottomLeft:SetTexCoord(0, 1, 0, 0.5859375)
+    b.BottomRight = Texture(area, NAME .. "BackgroundBottomRight", "BORDER", nil, 44, 75)
+    b.BottomRight:SetPoint("BOTTOMRIGHT")
+    b.BottomRight:SetPoint("TOPLEFT", b.TopLeft, "BOTTOMRIGHT")
+    b.BottomRight:SetTexCoord(0, 0.6875, 0, 0.5859375)
+    f.backgrounds = b
+
+    -- The scroll bar's trough, as PlayerTalentFrameScrollFrameBackgroundTop / Bottom.
+    local trough = "Interface\\PaperDollInfoFrame\\UI-Character-ScrollBar"
+    local troughTop = Texture(area, nil, "ARTWORK", trough, 31, 256)
+    troughTop:SetPoint("TOPLEFT", area, "TOPRIGHT", -2, 5)
+    troughTop:SetTexCoord(0, 0.484375, 0, 1)
+    local troughBottom = Texture(area, nil, "ARTWORK", trough, 31, 106)
+    troughBottom:SetPoint("BOTTOMLEFT", area, "BOTTOMRIGHT", -2, -2)
+    troughBottom:SetTexCoord(0.515625, 1, 0, 0.4140625)
 
     -- Shown on the Glyphs tab when TalentManagerGlyphs.lua didn't load (a new file needs a client restart).
     f.glyphMissing = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -349,7 +313,10 @@ local function BuildTree(f, treeHeight)
     f.glyphMissing:Hide()
 
     local canvas = CreateFrame("Frame", NAME .. "ScrollChildFrame", area)
-    canvas:SetAllPoints(area)
+    canvas:SetWidth(CANVAS_WIDTH)
+    canvas:SetHeight(50)
+    canvas:SetPoint("TOPLEFT")
+    area:SetScrollChild(canvas)
     f.canvas = canvas
 
     for i = 1, MAX_BRANCHES do
@@ -395,6 +362,7 @@ local function BuildTabs(f)
         tab:SetScript("OnClick", function(self)
             PanelTemplates_SetTab(f, self:GetID())
             PlaySound("igCharacterInfoTab")
+            UI:ScrollToTop()
             UI:Update()
         end)
         tab:SetScript("OnEnter", function(self)
@@ -420,16 +388,15 @@ local function BuildTabs(f)
 end
 
 local function Build()
-    local treeHeight = TreeHeight()
     frame = CreateFrame("Frame", NAME, UIParent)
     local f = frame
     UI.frame = f
     TalentFrame_Load(f)
 
-    BuildShell(f, TREE_TOP + treeHeight + BOTTOM_BARS)
+    BuildShell(f)
     BuildStatus(f)
     BuildBars(f)
-    BuildTree(f, treeHeight)
+    BuildTree(f)
     BuildTabs(f)
     if TM.Specs then
         TM.Specs:Build(f)
@@ -438,7 +405,6 @@ local function Build()
         TM.GlyphPane:Build(f)
     end
 
-    FitToScreen(f)
     local saved = TalentManagerDB and TalentManagerDB.point
     if saved then
         f:SetPoint(saved[1], UIParent, saved[1], saved[2], saved[3])
@@ -448,7 +414,6 @@ local function Build()
 
     f:SetScript("OnShow", function()
         PlaySound("TalentScreenOpen")
-        FitToScreen(f)
         -- Altbots come and go: ask for the picker's list again.
         if TM.serverSeen then
             TM:WithState("self", function() TM:Send("CHARS") end)
@@ -459,11 +424,6 @@ local function Build()
         PlaySound("TalentScreenClose")
         StaticPopup_Hide("TALENTMANAGER_NAME")
         StaticPopup_Hide("TALENTMANAGER_CONFIRM")
-    end)
-    f:RegisterEvent("UI_SCALE_CHANGED")
-    f:RegisterEvent("DISPLAY_SIZE_CHANGED")
-    f:SetScript("OnEvent", function()
-        FitToScreen(f)
     end)
 end
 
@@ -604,6 +564,9 @@ local function UpdateTree(f, tree, draft, pointsLeft)
     for piece, texture in pairs(f.backgrounds) do
         texture:SetTexture(base .. piece)
     end
+
+    f.canvas:SetHeight(TreeHeight(tree))
+    f.treeArea:UpdateScrollChildRect()
 
     TalentFrame_ResetBranches(f)
     for i = 1, MAX_TALENTS do
@@ -932,6 +895,13 @@ function UI:Update()
         UpdateTree(f, tree, draft, left)
     end
     TM:Fire("WINDOW")
+end
+
+function UI:ScrollToTop()
+    local bar = frame and _G[NAME .. "ScrollFrameScrollBar"]
+    if bar then
+        bar:SetValue(0)
+    end
 end
 
 function UI:OnGlyphTab()

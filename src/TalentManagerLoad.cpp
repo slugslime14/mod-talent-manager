@@ -1,5 +1,4 @@
-// Loading a saved spec onto the character: the checks, the swap cast and putting the talents, glyphs and action bars
-// in place.
+// Loading a saved spec onto the character: the checks, then putting the talents, glyphs and action bars in place.
 
 #include "Battleground.h"
 #include "SpellAuras.h"
@@ -12,7 +11,6 @@
 #include "StringFormat.h"
 #include "TalentManagerBots.h"
 #include "TalentManagerComms.h"
-#include "TalentManagerConfig.h"
 #include "TalentManagerGlyphs.h"
 #include "TalentManagerMgr.h"
 #include "TalentManagerTalents.h"
@@ -23,9 +21,6 @@ namespace TalentManager
 {
     namespace
     {
-        // Moving farther than this from where the swap cast began stops it.
-        constexpr float MAX_MOVE = 1.0f;
-
         using Talents::LiveRank;
 
         // The subject of a message about the player: you, or an altbot by name.
@@ -41,7 +36,7 @@ namespace TalentManager
                 player->InterruptNonMeleeSpells(false);
         }
 
-        // True when the build only adds ranks to the live talents: no reset, no swap cast.
+        // True when the build only adds ranks to the live talents: no reset needed.
         bool OnlyAdds(Player* player, Talents::Build const& build)
         {
             uint8 const classId = player->getClass();
@@ -132,36 +127,8 @@ namespace TalentManager
         return {};
     }
 
-    std::string Mgr::SwapInterrupt(Player* player, Swap const& swap)
-    {
-        if (!player->IsAlive())
-            return "dead";
-        if (player->IsInCombat())
-            return "combat";
-        if (player->GetMapId() != swap.mapId || player->IsInFlight())
-            return "moved";
-        // An altbot follows its master around and casts buffs on its own; only combat, death and leaving stop it.
-        if (swap.bot)
-            return {};
-        if (player->GetExactDist(swap.x, swap.y, swap.z) > MAX_MOVE)
-            return "moved";
-        if (player->IsNonMeleeSpellCast(false))
-            return "cast";
-        return {};
-    }
-
-    void Mgr::CancelSwap(Player* player, std::string_view reason)
-    {
-        if (!_swaps.erase(player->GetGUID().GetCounter()))
-            return;
-        _swapCount = uint32(_swaps.size());
-        Comms::Send(player, "CASTSTOP", reason);
-    }
-
-    // LOAD:id. A build that only adds points loads at once, like spending points in the talent frame (glyphs alone
-    // too, as inscribing is instant); otherwise a swap cast starts (CAST:ms,id) and the spec loads when it ends.
-    // Answers LOADED:id,missing,skipped,used,bars and the list, or ERR. bars is 1 when the spec's action bars were put
-    // on.
+    // LOAD:id. Loads at once, anywhere LoadBlocker allows. Answers LOADED:id,missing,skipped,used,bars and the list,
+    // or ERR. bars is 1 when the spec's action bars were put on.
     void Mgr::HandleLoad(Player* player, std::string_view payload)
     {
         Profile& profile = GetProfile(player);
@@ -184,82 +151,13 @@ namespace TalentManager
             Comms::SendError(player, error);
             return;
         }
-
-        // A new load replaces one still casting.
-        uint32 const guid = player->GetGUID().GetCounter();
-        if (_swaps.erase(guid))
-            _swapCount = uint32(_swaps.size());
-
-        if (!Cfg().swapCastTime || OnlyAdds(player, build))
-        {
-            FinishLoad(player, id);
-            return;
-        }
-
-        Swap& swap = _swaps[guid];
-        swap.specId = id;
-        swap.remaining = Cfg().swapCastTime;
-        swap.mapId = player->GetMapId();
-        swap.x = player->GetPositionX();
-        swap.y = player->GetPositionY();
-        swap.z = player->GetPositionZ();
-        swap.bot = Comms::IsBot(player);
-        _swapCount = uint32(_swaps.size());
-        Comms::Send(player, "CAST", Acore::StringFormat("{},{}", Cfg().swapCastTime, id));
+        FinishLoad(player, itr->second, build);
     }
 
-    void Mgr::OnUpdate(Player* player, uint32 diff)
-    {
-        if (!_swapCount.load(std::memory_order_relaxed))
-            return;
-
-        std::lock_guard<std::mutex> guard(_lock);
-        auto itr = _swaps.find(player->GetGUID().GetCounter());
-        if (itr == _swaps.end())
-            return;
-
-        std::string const reason = SwapInterrupt(player, itr->second);
-        if (!reason.empty())
-        {
-            CancelSwap(player, reason);
-            return;
-        }
-
-        if (itr->second.remaining > diff)
-        {
-            itr->second.remaining -= diff;
-            return;
-        }
-
-        uint32 const specId = itr->second.specId;
-        _swaps.erase(itr);
-        _swapCount = uint32(_swaps.size());
-        FinishLoad(player, specId);
-    }
-
-    void Mgr::FinishLoad(Player* player, uint32 specId)
+    void Mgr::FinishLoad(Player* player, Spec const& spec, Talents::Build const& build)
     {
         Profile& profile = GetProfile(player);
-        auto itr = profile.specs.find(specId);
-        if (itr == profile.specs.end())
-        {
-            Comms::SendError(player, "That spec no longer exists.");
-            return;
-        }
-        Spec const& spec = itr->second;
-
-        // Things may have changed during the swap cast.
-        StopBotCast(player);
-        std::string error = LoadBlocker(player);
-        Talents::Build build;
-        if (error.empty() && !ReadBuild(player, spec, build, error))
-            error = Acore::StringFormat("Can't load {}: {}.", spec.name, error);
-        if (!error.empty())
-        {
-            Comms::Send(player, "CASTSTOP", "failed");
-            Comms::SendError(player, error);
-            return;
-        }
+        uint32 const specId = spec.id;
 
         // Action bars: the spec loaded in this group so far gets the bars you have now. The new spec's bars, if it
         // has any, go on after the talents; the client's bars are cleared first, as a dual-spec switch does, so the

@@ -11,11 +11,10 @@
 
 TalentManager = {
     PREFIX = "TMGR",
-    PROTOCOL = 5,
+    PROTOCOL = 6,
     TIER_POINTS = 5,        -- points needed in a tree per row (PLAYER_TALENTS_PER_TIER)
     GLYPH_SLOTS = 6,
-    info = nil,             -- the server's INFO: { version, maxSpecs, castMs, points, activeGroup, groups, level,
-                            -- class }
+    info = nil,             -- the server's INFO: { version, maxSpecs, points, activeGroup, groups, level, class }
     trees = nil,            -- the class's talent trees, see LoadTrees
     -- The build shown in the window: { ranks = { [tree] = { [index] = rank } }, glyphs = { [socket] = id },
     -- source = "live" | "new" | "spec", specId, dirty }. "new" is a build not saved yet (New, Import).
@@ -23,7 +22,6 @@ TalentManager = {
     specs = {},             -- saved specs by list order: { id, sort, name, talents (link), glyphs, draft }
     specById = {},
     loaded = {},            -- [talent group] = id of the spec last loaded into it
-    casting = nil,          -- a swap cast in progress: { specId, started, duration }
     -- The class's glyphs from the server: { id, spellId, type (1 major, 2 minor, as GetGlyphSocketInfo), itemId,
     -- icon, known, name }, sorted by name.
     glyphs = nil,
@@ -46,7 +44,7 @@ TalentManager = {
 local TM = TalentManager
 
 -- The fields that belong to the shown character.
-local STATE_KEYS = { "char", "info", "trees", "draft", "specs", "specById", "loaded", "casting", "glyphs",
+local STATE_KEYS = { "char", "info", "trees", "draft", "specs", "specById", "loaded", "glyphs",
     "glyphById", "glyphBySpell", "maxSpecs", "listed", "pendingSelect", "live", "ready" }
 
 TM.CLASS_TOKENS = { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST", "DEATHKNIGHT", "SHAMAN", "MAGE", "WARLOCK",
@@ -91,11 +89,9 @@ function TM:On(event, callback)
 end
 
 -- A listener that fails is reported (the game's error handler) and the others still run. While a message about a
--- character that isn't shown is handled (TM.quiet), only the cast bar's events go out: the window shows someone else.
-local LOUD = { BAR = true }
-
+-- character that isn't shown is handled (TM.quiet), no events go out: the window shows someone else.
 function TM:Fire(event, ...)
-    if self.quiet and not LOUD[event] then
+    if self.quiet then
         return
     end
     for _, callback in ipairs(self.listeners[event] or {}) do
@@ -858,18 +854,17 @@ end
 
 local handlers = {}
 
--- INFO:version,maxSpecs,swapCastMs,talentPoints,activeGroup,groupCount,level,class
+-- INFO:version,maxSpecs,talentPoints,activeGroup,groupCount,level,class
 function handlers.INFO(payload)
     local f = Split(payload, ",")
     TM.info = {
         version = tonumber(f[1]) or 0,
         maxSpecs = tonumber(f[2]) or 0,
-        castMs = tonumber(f[3]) or 0,
-        points = tonumber(f[4]) or 0,
-        activeGroup = tonumber(f[5]) or 1,
-        groups = tonumber(f[6]) or 1,
-        level = tonumber(f[7]),
-        class = tonumber(f[8]),
+        points = tonumber(f[3]) or 0,
+        activeGroup = tonumber(f[4]) or 1,
+        groups = tonumber(f[5]) or 1,
+        level = tonumber(f[6]),
+        class = tonumber(f[7]),
     }
     TM.serverSeen = true
     if TM.char and TM.info.level then
@@ -1111,39 +1106,6 @@ function handlers.SAVED(payload)
     TM.pendingSelect = tonumber(payload)
 end
 
--- CAST:ms,id: the swap cast for spec id started.
-function handlers.CAST(payload)
-    local f = Split(payload, ",")
-    TM.casting = { specId = tonumber(f[2]), started = GetTime(), duration = (tonumber(f[1]) or 0) / 1000 }
-    local spec = TM.specById[TM.casting.specId]
-    TM:Fire("CAST")
-    TM:Fire("BAR", "start", StateKey(), (TM.char and (TM.char.name .. ": ") or "") .. "Loading "
-        .. (spec and spec.name or "spec"), TM.casting.duration)
-end
-
--- %s is "You" or the altbot's name.
-local STOP_REASONS = {
-    moved = "%s moved.",
-    combat = "%s entered combat.",
-    dead = "%s died.",
-    cast = "%s started casting.",
-    stopped = "Stopped.",
-    deleted = "The spec was deleted.",
-}
-
--- CASTSTOP:reason: the swap cast ended without loading.
-function handlers.CASTSTOP(payload)
-    local casting = TM.casting
-    TM.casting = nil
-    TM:Fire("CASTSTOP", payload)
-    TM:Fire("BAR", "stop", StateKey())
-    if payload ~= "failed" then
-        local spec = casting and TM.specById[casting.specId]
-        local reason = (STOP_REASONS[payload] or payload):format(TM.char and TM.char.name or "You")
-        TM:Say(("Loading %s stopped: %s"):format(spec and spec.name or "the spec", reason))
-    end
-end
-
 local function GlyphNames(list)
     local names = {}
     for _, id in ipairs(Split(list, "/")) do
@@ -1162,9 +1124,7 @@ function handlers.LOADED(payload)
     local id, missing = tonumber(f[1]), tonumber(f[2]) or 0
     local skipped, used = GlyphNames(f[3]), GlyphNames(f[4])
     local bars = f[5] == "1"
-    TM.casting = nil
     TM:Fire("SPECLOADED", id)
-    TM:Fire("BAR", "done", StateKey())
     local spec = id and TM.specById[id]
     local name = (spec and spec.name or "the spec") .. (bars and " with its action bars" or "")
     if missing > 0 then
@@ -1250,10 +1210,6 @@ function TM:LoadSpec(id)
         return
     end
     self:Send("LOAD", tostring(id))
-end
-
-function TM:StopLoad()
-    self:Send("STOP")
 end
 
 -- Puts your live talents into the shown saved spec, as unsaved changes (Save keeps them).

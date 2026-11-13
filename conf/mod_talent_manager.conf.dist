@@ -17,17 +17,6 @@
 TalentManager.Enable = 1
 
 #
-#    TalentManager.SwapCastTime
-#        Description: Time in milliseconds it takes to load a saved spec that removes or moves
-#                     talent points. Combat, moving or dying cancels it. A load that only adds
-#                     points is always instant.
-#        Default:     5000
-#                     0    (Instant)
-#
-
-TalentManager.SwapCastTime = 5000
-
-#
 #    TalentManager.MaxSpecs
 #        Description: Maximum number of saved specs per character.
 #        Default:     20

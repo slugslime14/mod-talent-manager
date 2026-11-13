@@ -33,14 +33,8 @@ public:
         PLAYERHOOK_ON_LOGIN,
         PLAYERHOOK_ON_LOGOUT,
         PLAYERHOOK_ON_DELETE_FROM_DB,
-        PLAYERHOOK_ON_UPDATE,
         PLAYERHOOK_CAN_PLAYER_USE_PRIVATE_CHAT
     }) { }
-
-    void OnPlayerUpdate(Player* player, uint32 diff) override
-    {
-        Mgr::Instance().OnUpdate(player, diff);
-    }
 
     void OnPlayerLogin(Player* player) override
     {
