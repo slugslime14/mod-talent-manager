@@ -99,16 +99,17 @@ local function SocketGlyph(id)
     return draft and TM.glyphById[draft.glyphs[id] or 0]
 end
 
+-- %s is "your bags" or "<altbot>'s bags".
 local STATE_LINES = {
     known = { "Known: a load puts it in for free.", 0.1, 1, 0.1 },
-    bags = { "Not known yet: a load uses one from your bags, then it's known.", 1, 0.82, 0 },
-    none = { "Not known and none in your bags: a load leaves it out. Inscribe it once by hand, or have one in your "
-        .. "bags.", 1, 0.25, 0.25 },
+    bags = { "Not known yet: a load uses one from %s, then it's known.", 1, 0.82, 0 },
+    none = { "Not known and none in %s: a load leaves it out. Inscribe it once by hand, or have one in the bags.",
+        1, 0.25, 0.25 },
 }
 
 local function AddStateLine(glyph)
     local line = STATE_LINES[TM:GlyphState(glyph)]
-    GameTooltip:AddLine(line[1], line[2], line[3], line[4], true)
+    GameTooltip:AddLine(line[1]:format(TM:Bags()), line[2], line[3], line[4], true)
 end
 
 local function SocketTooltip(socket)
@@ -343,7 +344,7 @@ local function UpdateRow(row, glyph)
             row.state:SetText("Known")
             row.state:SetTextColor(0.1, 1, 0.1)
         elseif state == "bags" then
-            row.state:SetText(("In bags (%d)"):format(GetItemCount(glyph.itemId)))
+            row.state:SetText(("In bags (%d)"):format(TM:GlyphBagCount(glyph)))
             row.state:SetTextColor(1, 0.82, 0)
         else
             row.state:SetText("Not known")

@@ -1,4 +1,5 @@
-// Loading a saved spec onto the character: the checks, the swap cast and putting the talents and glyphs in place.
+// Loading a saved spec onto the character: the checks, the swap cast and putting the talents, glyphs and action bars
+// in place.
 
 #include "Battleground.h"
 #include "SpellAuras.h"
@@ -9,11 +10,13 @@
 #include "Player.h"
 #include "StringConvert.h"
 #include "StringFormat.h"
+#include "TalentManagerBots.h"
 #include "TalentManagerComms.h"
 #include "TalentManagerConfig.h"
 #include "TalentManagerGlyphs.h"
 #include "TalentManagerMgr.h"
 #include "TalentManagerTalents.h"
+#include <algorithm>
 #include <array>
 
 namespace TalentManager
@@ -23,13 +26,19 @@ namespace TalentManager
         // Moving farther than this from where the swap cast began stops it.
         constexpr float MAX_MOVE = 1.0f;
 
-        // The rank of a talent in the active talent group, 0 for none.
-        uint8 LiveRank(Player* player, TalentEntry const* talent)
+        using Talents::LiveRank;
+
+        // The subject of a message about the player: you, or an altbot by name.
+        std::string Who(Player* player)
         {
-            for (int8 rank = MAX_TALENT_RANK - 1; rank >= 0; --rank)
-                if (talent->RankID[rank] && player->HasTalent(talent->RankID[rank], player->GetActiveSpec()))
-                    return uint8(rank + 1);
-            return 0;
+            return Comms::IsBot(player) ? player->GetName() : "You";
+        }
+
+        // Bots cast buffs on their own all the time; their casts are stopped instead of stopping the load.
+        void StopBotCast(Player* player)
+        {
+            if (Comms::IsBot(player) && player->IsNonMeleeSpellCast(false))
+                player->InterruptNonMeleeSpells(false);
         }
 
         // True when the build only adds ranks to the live talents: no reset, no swap cast.
@@ -104,21 +113,22 @@ namespace TalentManager
 
     std::string Mgr::LoadBlocker(Player* player)
     {
+        std::string const who = Who(player);
         if (!player->IsAlive())
-            return "You can't change talents while dead.";
+            return who + " can't change talents while dead.";
         if (player->IsInCombat())
-            return "You can't change talents in combat.";
+            return who + " can't change talents in combat.";
         if (player->InArena())
-            return "You can't change talents in an arena.";
+            return who + " can't change talents in an arena.";
         if (Battleground* bg = player->GetBattleground())
             if (bg->GetStatus() == STATUS_IN_PROGRESS)
-                return "You can't change talents once the battleground has started.";
+                return who + " can't change talents once the battleground has started.";
         if (player->IsInFlight())
-            return "You can't change talents while flying a taxi.";
+            return who + " can't change talents while flying a taxi.";
         if (player->GetVehicle())
-            return "You can't change talents on a vehicle.";
+            return who + " can't change talents on a vehicle.";
         if (player->IsNonMeleeSpellCast(false))
-            return "You can't change talents while casting.";
+            return who + " can't change talents while casting.";
         return {};
     }
 
@@ -128,8 +138,12 @@ namespace TalentManager
             return "dead";
         if (player->IsInCombat())
             return "combat";
-        if (player->GetMapId() != swap.mapId || player->IsInFlight()
-            || player->GetExactDist(swap.x, swap.y, swap.z) > MAX_MOVE)
+        if (player->GetMapId() != swap.mapId || player->IsInFlight())
+            return "moved";
+        // An altbot follows its master around and casts buffs on its own; only combat, death and leaving stop it.
+        if (swap.bot)
+            return {};
+        if (player->GetExactDist(swap.x, swap.y, swap.z) > MAX_MOVE)
             return "moved";
         if (player->IsNonMeleeSpellCast(false))
             return "cast";
@@ -146,7 +160,8 @@ namespace TalentManager
 
     // LOAD:id. A build that only adds points loads at once, like spending points in the talent frame (glyphs alone
     // too, as inscribing is instant); otherwise a swap cast starts (CAST:ms,id) and the spec loads when it ends.
-    // Answers LOADED:id,missing,skipped,used and the list, or ERR.
+    // Answers LOADED:id,missing,skipped,used,bars and the list, or ERR. bars is 1 when the spec's action bars were put
+    // on.
     void Mgr::HandleLoad(Player* player, std::string_view payload)
     {
         Profile& profile = GetProfile(player);
@@ -159,6 +174,7 @@ namespace TalentManager
             return;
         }
 
+        StopBotCast(player);
         std::string error = LoadBlocker(player);
         Talents::Build build;
         if (error.empty() && !ReadBuild(player, itr->second, build, error))
@@ -187,6 +203,7 @@ namespace TalentManager
         swap.x = player->GetPositionX();
         swap.y = player->GetPositionY();
         swap.z = player->GetPositionZ();
+        swap.bot = Comms::IsBot(player);
         _swapCount = uint32(_swaps.size());
         Comms::Send(player, "CAST", Acore::StringFormat("{},{}", Cfg().swapCastTime, id));
     }
@@ -232,6 +249,7 @@ namespace TalentManager
         Spec const& spec = itr->second;
 
         // Things may have changed during the swap cast.
+        StopBotCast(player);
         std::string error = LoadBlocker(player);
         Talents::Build build;
         if (error.empty() && !ReadBuild(player, spec, build, error))
@@ -241,6 +259,23 @@ namespace TalentManager
             Comms::Send(player, "CASTSTOP", "failed");
             Comms::SendError(player, error);
             return;
+        }
+
+        // Action bars: the spec loaded in this group so far gets the bars you have now. The new spec's bars, if it
+        // has any, go on after the talents; the client's bars are cleared first, as a dual-spec switch does, so the
+        // client doesn't take buttons off by itself while spells are unlearned. Bots have no bars to keep.
+        Bars bars;
+        bool restoreBars = false;
+        if (!Comms::IsBot(player))
+        {
+            uint8 const group = player->GetActiveSpec();
+            uint32 const previous = group < TALENT_GROUPS ? profile.loaded[group] : 0;
+            auto previousSpec = profile.specs.find(previous);
+            if (previousSpec != profile.specs.end())
+                StoreBars(player, previousSpec->second);
+            restoreBars = previous != specId && BarsFor(player, profile, spec, bars);
+            if (restoreBars)
+                player->SendActionButtons(2);
         }
 
         // Wipe the active talent group for free unless the build only adds ranks, then learn the build row by row,
@@ -261,6 +296,8 @@ namespace TalentManager
         std::vector<uint32> used;
         ApplyGlyphs(player, profile, spec, skipped, used);
         player->SendTalentsInfoData(false);
+        if (restoreBars)
+            ApplyBars(player, bars);
 
         uint32 missing = 0;
         for (uint8 t = 0; t < Talents::TREES; ++t)
@@ -277,8 +314,15 @@ namespace TalentManager
         MarkLoaded(player, profile, specId);
         player->SaveToDB(false, false);
 
-        Comms::Send(player, "LOADED", Acore::StringFormat("{},{},{},{}", specId, missing, JoinIds(skipped),
-            JoinIds(used)));
+        if (Comms::IsBot(player))
+        {
+            bool const glyphsChosen = std::any_of(spec.glyphs.begin(), spec.glyphs.end(), [](uint32 g) { return g; });
+            Bots::AfterLoad(player, glyphsChosen);
+            SendLive(player);
+        }
+
+        Comms::Send(player, "LOADED", Acore::StringFormat("{},{},{},{},{}", specId, missing, JoinIds(skipped),
+            JoinIds(used), restoreBars ? 1 : 0));
         SendSpecs(player);
         if (!used.empty())
             SendGlyphs(player);

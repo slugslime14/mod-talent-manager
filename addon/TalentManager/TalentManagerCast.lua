@@ -1,7 +1,7 @@
--- TalentManager swap cast bar: shown while the server counts down a spec load. It is built like the stock casting
--- bar (CastingBarFrameTemplate: border, spark and flash textures, the same colours) and sits where that bar sits.
--- Not the stock bar itself: that one is driven by real spell casts. The server decides when the cast ends or stops;
--- this bar only shows it.
+-- TalentManager swap cast bar: shown while the server counts down a spec load, yours or an altbot's. It is built
+-- like the stock casting bar (CastingBarFrameTemplate: border, spark and flash textures, the same colours) and sits
+-- where that bar sits. Not the stock bar itself: that one is driven by real spell casts. The server decides when the
+-- cast ends or stops; this bar only shows it.
 
 local TM = TalentManager
 
@@ -42,15 +42,17 @@ flash:SetWidth(256)
 flash:SetHeight(64)
 flash:SetPoint("TOP", 0, 28)
 
+-- The state key ("self" or an altbot's guid) whose load the bar shows; fading out once it ended.
+local owner, fadeStart
+
 -- Right-click the bar to stop the load.
 bar:EnableMouse(true)
 bar:SetScript("OnMouseUp", function(_, button)
-    if button == "RightButton" and TM.casting then
-        TM:StopLoad()
+    if button == "RightButton" and owner and not fadeStart then
+        TM:WithState(owner, function() TM:StopLoad() end)
     end
 end)
 
-local fadeStart
 local FADE_TIME = 0.5
 
 local function Finish(r, g, b, label)
@@ -65,7 +67,6 @@ end
 
 bar:SetScript("OnUpdate", function(self)
     local now = GetTime()
-    local casting = TM.casting
     if fadeStart then
         local t = (now - fadeStart) / FADE_TIME
         if t >= 1 then
@@ -77,35 +78,34 @@ bar:SetScript("OnUpdate", function(self)
         self:SetAlpha(1 - t)
         return
     end
-    if not casting then
+    if not self.started then
         return
     end
-    local progress = casting.duration > 0 and math.min(1, (now - casting.started) / casting.duration) or 1
+    local progress = self.duration > 0 and math.min(1, (now - self.started) / self.duration) or 1
     self:SetValue(progress)
     spark:SetPoint("CENTER", self, "LEFT", progress * self:GetWidth(), 2)
 end)
 
-TM:On("CAST", function()
-    local casting = TM.casting
-    local spec = casting and TM.specById[casting.specId]
-    fadeStart = nil
-    bar:SetAlpha(1)
-    bar:SetStatusBarColor(1.0, 0.7, 0.0)
-    bar:SetValue(0)
-    flash:Hide()
-    spark:Show()
-    text:SetText("Loading " .. (spec and spec.name or "spec"))
-    bar:Show()
-end)
-
-TM:On("CASTSTOP", function()
-    if bar:IsShown() then
-        Finish(1.0, 0.0, 0.0, INTERRUPTED or "Interrupted")
-    end
-end)
-
-TM:On("LOADED", function()
-    if bar:IsShown() then
-        Finish(0.0, 1.0, 0.0, text:GetText())
+-- BAR events come for any character (yours or an altbot's): ("start", key, label, seconds), ("stop", key),
+-- ("done", key). The bar shows the latest start; a stop or done for someone else's cast leaves it alone.
+TM:On("BAR", function(what, key, label, duration)
+    if what == "start" then
+        owner = key
+        bar.started, bar.duration = GetTime(), duration or 0
+        fadeStart = nil
+        bar:SetAlpha(1)
+        bar:SetStatusBarColor(1.0, 0.7, 0.0)
+        bar:SetValue(0)
+        flash:Hide()
+        spark:Show()
+        text:SetText(label)
+        bar:Show()
+    elseif key == owner and bar:IsShown() and not fadeStart then
+        owner = nil
+        if what == "stop" then
+            Finish(1.0, 0.0, 0.0, INTERRUPTED or "Interrupted")
+        else
+            Finish(0.0, 1.0, 0.0, text:GetText())
+        end
     end
 end)

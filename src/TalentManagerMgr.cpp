@@ -2,9 +2,11 @@
 #include "DBCStores.h"
 #include "DatabaseEnv.h"
 #include "Log.h"
+#include "ObjectAccessor.h"
 #include "Player.h"
 #include "StringConvert.h"
 #include "StringFormat.h"
+#include "TalentManagerBots.h"
 #include "TalentManagerComms.h"
 #include "TalentManagerConfig.h"
 #include "TalentManagerGlyphs.h"
@@ -94,6 +96,7 @@ namespace TalentManager
         trans->Append("DELETE FROM talent_manager_spec WHERE guid = {}", guid);
         trans->Append("DELETE FROM talent_manager_loaded WHERE guid = {}", guid);
         trans->Append("DELETE FROM talent_manager_glyph WHERE guid = {}", guid);
+        trans->Append("DELETE FROM talent_manager_action WHERE guid = {}", guid);
     }
 
     Profile& Mgr::GetProfile(Player* player)
@@ -118,6 +121,21 @@ namespace TalentManager
                 for (uint8 slot = 0; slot < GLYPH_SLOTS; ++slot)
                     spec.glyphs[slot] = fields[4 + slot].Get<uint32>();
                 profile.specs.emplace(spec.id, std::move(spec));
+            } while (result->NextRow());
+        }
+        if (QueryResult result = CharacterDatabase.Query("SELECT spec_id, button, action, type FROM "
+            "talent_manager_action WHERE guid = {}", guid))
+        {
+            do
+            {
+                Field* fields = result->Fetch();
+                auto itr = profile.specs.find(fields[0].Get<uint32>());
+                if (itr == profile.specs.end())
+                    continue;
+                itr->second.hasBars = true;
+                uint8 const button = fields[1].Get<uint8>();
+                if (button < MAX_ACTION_BUTTONS)
+                    itr->second.bars[button] = fields[2].Get<uint32>() | (uint32(fields[3].Get<uint8>()) << 24);
             } while (result->NextRow());
         }
         if (QueryResult result = CharacterDatabase.Query("SELECT talent_group, spec_id FROM talent_manager_loaded "
@@ -175,8 +193,9 @@ namespace TalentManager
         return profile.known.size() != before;
     }
 
-    // GLYPHBEGIN:count, then GLYPH: entries "id,spellId,type,itemId,iconId,known" separated by ';', then GLYPHEND:.
-    // type is 0 for major, 1 for minor; known is 1 or 0. The addon counts glyph items in the bags itself.
+    // GLYPHBEGIN:count, then GLYPH: entries "id,spellId,type,itemId,iconId,known,bags" separated by ';', then
+    // GLYPHEND:. type is 0 for major, 1 for minor; known is 1 or 0; bags is how many of the glyph item the character
+    // carries (the addon counts your own bags itself, as they change).
     void Mgr::SendGlyphs(Player* player)
     {
         Profile const& profile = GetProfile(player);
@@ -185,22 +204,42 @@ namespace TalentManager
         std::vector<std::string> entries;
         entries.reserve(list.size());
         for (Glyphs::Glyph const* glyph : list)
-            entries.push_back(Acore::StringFormat("{},{},{},{},{},{}", glyph->id, glyph->spellId, glyph->type,
-                glyph->itemId, glyph->iconId, profile.known.count(glyph->id) ? 1 : 0));
+            entries.push_back(Acore::StringFormat("{},{},{},{},{},{},{}", glyph->id, glyph->spellId, glyph->type,
+                glyph->itemId, glyph->iconId, profile.known.count(glyph->id) ? 1 : 0,
+                player->GetItemCount(glyph->itemId)));
         Comms::SendList(player, "GLYPH", entries);
         Comms::Send(player, "GLYPHEND");
     }
 
-    void Mgr::HandleAddonMessage(Player* player, std::string const& body)
+    void Mgr::HandleAddonMessage(Player* viewer, std::string const& body)
     {
-        if (!IsUser(player))
+        if (!IsUser(viewer))
         {
-            Comms::SendError(player, "The talent manager is disabled on this server.");
+            Comms::SendError(viewer, "The talent manager is disabled on this server.");
             return;
         }
 
         std::lock_guard<std::mutex> guard(_lock);
-        std::string_view const text(body);
+        std::string_view text(body);
+
+        // "@<guid>|CMD:payload" is about one of the viewer's altbots. Everything below then works on the bot, and
+        // Comms sends the answers back to the viewer, tagged.
+        Player* player = viewer;
+        if (!text.empty() && text.front() == '@')
+        {
+            std::size_t const bar = text.find('|');
+            if (bar == std::string_view::npos)
+                return;
+            uint32 const guid = Acore::StringTo<uint32>(text.substr(1, bar - 1)).value_or(0);
+            text = text.substr(bar + 1);
+            if (guid != viewer->GetGUID().GetCounter())
+            {
+                player = ResolveBot(viewer, guid);
+                if (!player)
+                    return;
+            }
+        }
+
         std::size_t const colon = text.find(':');
         std::string_view const command = text.substr(0, colon);
         std::string_view const payload = colon == std::string_view::npos ? std::string_view() : text.substr(colon + 1);
@@ -221,6 +260,12 @@ namespace TalentManager
             CancelSwap(player, "stopped");
         else if (command == "GLYPHS")
             SendGlyphs(player);
+        else if (command == "CHARS")
+            SendCharacters(viewer);
+        else if (command == "TREES")
+            SendTrees(player);
+        else if (command == "LIVE")
+            SendLive(player);
         else if (command == "GSYNC")
         {
             // A glyph was inscribed by hand.
@@ -229,18 +274,90 @@ namespace TalentManager
         }
     }
 
-    // INFO:version,maxSpecs,swapCastMs,talentPoints,activeGroup,groupCount
+    // INFO:version,maxSpecs,swapCastMs,talentPoints,activeGroup,groupCount,level,class
     // activeGroup is 1-based, as the client's GetActiveTalentGroup() counts.
     void Mgr::SendInfo(Player* player)
     {
-        Comms::Send(player, "INFO", Acore::StringFormat("{},{},{},{},{},{}", PROTOCOL_VERSION, Cfg().maxSpecs,
+        Comms::Send(player, "INFO", Acore::StringFormat("{},{},{},{},{},{},{},{}", PROTOCOL_VERSION, Cfg().maxSpecs,
             Cfg().swapCastTime, player->CalculateTalentsPoints(), uint32(player->GetActiveSpec()) + 1,
-            uint32(player->GetSpecsCount())));
+            uint32(player->GetSpecsCount()), uint32(player->GetLevel()), uint32(player->getClass())));
+    }
+
+    Player* Mgr::ResolveBot(Player* viewer, uint32 guid)
+    {
+        Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(guid));
+        if (!bot || !bot->IsInWorld())
+        {
+            Comms::SendError(viewer, "That character isn't online.");
+            return nullptr;
+        }
+        if (!Bots::IsMasteredBy(bot, viewer))
+        {
+            Comms::SendError(viewer, Acore::StringFormat("You aren't {}'s master.", bot->GetName()));
+            return nullptr;
+        }
+        if (!IsUser(bot))
+        {
+            Comms::SendError(viewer, Acore::StringFormat("{} is a random bot; the talent manager is for your own "
+                "characters.", bot->GetName()));
+            return nullptr;
+        }
+        return bot;
+    }
+
+    // CHARBEGIN:, CHAR: entries "guid,name,class,level" (you first, then your online altbots by name), CHAREND:.
+    // Only altbots have profiles besides you, so this never walks the random bots.
+    void Mgr::SendCharacters(Player* viewer)
+    {
+        std::vector<Player*> bots;
+        for (auto const& [guid, profile] : _profiles)
+        {
+            if (guid == viewer->GetGUID().GetCounter())
+                continue;
+            Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(guid));
+            if (bot && bot->IsInWorld() && Bots::IsMasteredBy(bot, viewer))
+                bots.push_back(bot);
+        }
+        std::sort(bots.begin(), bots.end(), [](Player* a, Player* b) { return a->GetName() < b->GetName(); });
+        bots.insert(bots.begin(), viewer);
+
+        std::vector<std::string> entries;
+        for (Player* character : bots)
+            entries.push_back(Acore::StringFormat("{},{},{},{}", character->GetGUID().GetCounter(),
+                character->GetName(), uint32(character->getClass()), uint32(character->GetLevel())));
+        Comms::Send(viewer, "CHARBEGIN");
+        Comms::SendList(viewer, "CHAR", entries);
+        Comms::Send(viewer, "CHAREND");
+    }
+
+    // TREEBEGIN:class, TREE: entries "tree,talentId,row,column,maxRank,rank1Spell,dependsOn,dependsOnRank" (tree
+    // 1-3 in tab order; row, column and dependsOnRank 0-based as in Talent.dbc; dependsOn 0 for none), TREEEND:class.
+    void Mgr::SendTrees(Player* player)
+    {
+        uint8 const classId = player->getClass();
+        std::vector<std::string> entries;
+        for (uint8 t = 0; t < Talents::TREES; ++t)
+            for (TalentEntry const* talent : Talents::Tree(classId, t))
+                entries.push_back(Acore::StringFormat("{},{},{},{},{},{},{},{}", t + 1, talent->TalentID, talent->Row,
+                    talent->Col, Talents::MaxRank(talent), talent->RankID[0], talent->DependsOn,
+                    talent->DependsOnRank));
+        Comms::Send(player, "TREEBEGIN", std::to_string(classId));
+        Comms::SendList(player, "TREE", entries);
+        Comms::Send(player, "TREEEND", std::to_string(classId));
+    }
+
+    // LIVE:talents,glyph1..glyph6, the active talent group.
+    void Mgr::SendLive(Player* player)
+    {
+        std::string payload = Talents::Encode(Talents::Live(player));
+        for (uint8 slot = 0; slot < GLYPH_SLOTS; ++slot)
+            payload += Acore::StringFormat(",{}", player->GetGlyph(slot));
+        Comms::Send(player, "LIVE", payload);
     }
 
     // SPECBEGIN:count,maxSpecs,loaded1,loaded2 (the spec loaded in each talent group, 0 for none), then SPEC:
-    // entries "id,sort,name,talents,glyph1..glyph6" separated by ';', then SPECEND:. Names never hold ',' or ';'
-    // (CheckName).
+    // entries "id,sort,name,talents,glyph1..glyph6,bars" separated by ';', then SPECEND:. bars is 1 when the spec
+    // has action bars saved. Names never hold ',' or ';' (CheckName).
     void Mgr::SendSpecs(Player* player)
     {
         Profile const& profile = GetProfile(player);
@@ -253,6 +370,7 @@ namespace TalentManager
             std::string entry = Acore::StringFormat("{},{},{},{}", spec.id, spec.sort, spec.name, spec.talents);
             for (uint32 glyph : spec.glyphs)
                 entry += Acore::StringFormat(",{}", glyph);
+            entry += spec.hasBars ? ",1" : ",0";
             entries.push_back(std::move(entry));
         }
         Comms::SendList(player, "SPEC", entries);
@@ -400,6 +518,7 @@ namespace TalentManager
             uint32 const guid = player->GetGUID().GetCounter();
             CharacterDatabase.Execute("DELETE FROM talent_manager_spec WHERE guid = {} AND id = {}", guid, id);
             CharacterDatabase.Execute("DELETE FROM talent_manager_loaded WHERE guid = {} AND spec_id = {}", guid, id);
+            CharacterDatabase.Execute("DELETE FROM talent_manager_action WHERE guid = {} AND spec_id = {}", guid, id);
             for (uint32& loaded : profile.loaded)
                 if (loaded == id)
                     loaded = 0;

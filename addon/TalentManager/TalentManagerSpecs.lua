@@ -1,6 +1,7 @@
--- TalentManager spec list: a panel on the right of the talent window. The first row is your live talents, then your
--- saved specs. Clicking a row shows it in the tree; the buttons under the list make, copy, rename, delete, import
--- and export specs, and Load puts the shown spec on your character. Saving is the Save button under the tree.
+-- TalentManager spec list: a panel on the right of the talent window. At the top a picker chooses whose specs are
+-- shown: you or one of your online altbots. The first row is the live talents, then the saved specs. Clicking a row
+-- shows it in the tree; the buttons under the list make, copy, rename, delete, import and export specs, and Load puts
+-- the shown spec on the character. Saving is the Save button under the tree.
 
 local TM = TalentManager
 local UI = TM.UI
@@ -10,11 +11,11 @@ TM.Specs = Specs
 local NAME = "TalentManagerSpecs"
 local ROW_HEIGHT = 34
 local ROW_WIDTH = 186
-local LIST_TOP = 40         -- below the panel's title
+local LIST_TOP = 66         -- below the panel's title and the character picker
 local BUTTONS_HEIGHT = 120  -- the three button rows and the note line at the bottom
 local EMPTY_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
 
-local panel
+local panel, picker
 local rows = {}
 local offset = 0            -- saved specs scrolled past (the mouse wheel; the live row always stays first)
 
@@ -38,7 +39,7 @@ local function RowEnter(row)
     GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
     if what == "live" then
         GameTooltip:SetText("Live talents")
-        GameTooltip:AddLine("The talents your character has now.", 1, 1, 1, true)
+        GameTooltip:AddLine(("The talents %s has now."):format(TM:Subject()), 1, 1, 1, true)
     else
         local spec = TM.specById[what]
         if not spec then
@@ -46,6 +47,14 @@ local function RowEnter(row)
         end
         GameTooltip:SetText(spec.name)
         GameTooltip:AddLine(TM:Split(spec.draft) .. "  (" .. TM:TotalPoints(spec.draft) .. " points)", 1, 1, 1)
+        if TM.char then
+            -- Bots have no action bars.
+        elseif spec.hasBars then
+            GameTooltip:AddLine("Action bars saved: loading it puts them back.", 0.5, 0.5, 0.5, true)
+        else
+            GameTooltip:AddLine("No action bars saved yet: loading it keeps your bars. They are saved into it when "
+                .. "you load another spec.", 0.5, 0.5, 0.5, true)
+        end
     end
     GameTooltip:Show()
 end
@@ -154,7 +163,7 @@ local function LoadBlocker()
     elseif TM.draft.dirty then
         return "Save the changes first."
     elseif TM:LoadedSpec() == spec and not TM:LiveDiffers(spec) then
-        return "This spec is already on your character."
+        return "This spec is already on " .. TM:Subject() .. "."
     end
 end
 
@@ -168,10 +177,14 @@ local function LoadTooltip()
     end
     local spec = ShownSpec()
     if TM:LoadedSpec() == spec then
-        return "Put your talents and glyphs back to " .. spec.name .. "."
+        return "Put the talents and glyphs back to " .. spec.name .. "."
+    end
+    if TM.char then
+        return "Put " .. spec.name .. " on " .. TM.char.name .. ", out of combat. Talents that move or come out take a "
+            .. "short cast; combat stops it. Glyphs go in with it, and the bot sets up its strategies again."
     end
     return "Put " .. spec.name .. " on your character, out of combat. Talents that move or come out take a "
-        .. "short cast; moving or combat stops it. Glyphs go in with it."
+        .. "short cast; moving or combat stops it. Glyphs and the spec's action bars go in with it."
 end
 
 local BUTTONS = {
@@ -185,6 +198,63 @@ local BUTTONS = {
     { key = "export", text = "Export", click = ExportClicked,
         tip = "Show the build as a talent calculator link, to copy." },
 }
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- Character picker
+
+local function CharacterLabel(character)
+    local token = TM.CLASS_TOKENS[character.class]
+    local color = token and RAID_CLASS_COLORS and RAID_CLASS_COLORS[token]
+    local name = character.name
+    if color then
+        name = ("|cff%02x%02x%02x%s|r"):format(color.r * 255, color.g * 255, color.b * 255, name)
+    end
+    return name .. " (" .. character.level .. ")"
+end
+
+local function PickerClicked(_, guid)
+    TM:ShowCharacter(guid)
+    CloseDropDownMenus()
+end
+
+local function InitPicker()
+    local shown = TM.char and TM.char.guid or TM.selfGuid
+    local list = TM.characters
+    if #list == 0 then
+        list = { { guid = nil, name = UnitName("player"), class = 0, level = UnitLevel("player") } }
+    end
+    for i, character in ipairs(list) do
+        local info = UIDropDownMenu_CreateInfo()
+        info.text = CharacterLabel(character) .. (i == 1 and " - you" or "")
+        info.arg1 = character.guid
+        info.func = PickerClicked
+        info.checked = character.guid == shown or (i == 1 and not TM.char)
+        UIDropDownMenu_AddButton(info)
+    end
+    if #TM.characters <= 1 then
+        local info = UIDropDownMenu_CreateInfo()
+        info.text = "Online altbots you lead show here."
+        info.notCheckable = 1
+        info.disabled = 1
+        UIDropDownMenu_AddButton(info)
+    end
+end
+
+local function UpdatePicker()
+    if not picker then
+        return
+    end
+    local text
+    if TM.pending then
+        local character = TM:CharacterByGuid(TM.pending)
+        text = "Loading " .. (character and character.name or "...") .. "..."
+    elseif TM.char then
+        text = CharacterLabel(TM.char)
+    else
+        text = UnitName("player") .. " (you)"
+    end
+    UIDropDownMenu_SetText(picker, text)
+end
 
 -- ---------------------------------------------------------------------------------------------------------------
 -- Building and updating
@@ -215,6 +285,19 @@ function Specs:Build(f)
     title:SetPoint("TOP", 0, -18)
     title:SetText("Talent Specs")
 
+    picker = CreateFrame("Frame", "TalentManagerCharacterDropDown", panel, "UIDropDownMenuTemplate")
+    picker:SetPoint("TOPLEFT", panel, "TOPLEFT", -2, -32)
+    UIDropDownMenu_SetWidth(picker, ROW_WIDTH - 22)
+    UIDropDownMenu_Initialize(picker, InitPicker)
+    picker:EnableMouse(true)
+    picker:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Whose specs")
+        GameTooltip:AddLine("You, or one of your online altbots. Each keeps its own specs and glyphs.", 1, 1, 1, true)
+        GameTooltip:Show()
+    end)
+    picker:SetScript("OnLeave", GameTooltip_Hide)
+
     panel.buttons = {}
     for i, def in ipairs(BUTTONS) do
         local button = UI.TooltipButton(panel, NAME .. "Button" .. def.key, 60, def.text, def.tip)
@@ -230,7 +313,7 @@ function Specs:Build(f)
     panel.load:SetScript("OnClick", LoadClicked)
 
     panel.useLive = UI.TooltipButton(panel, NAME .. "UseLiveButton", 62, "Use live",
-        "Copy your live talents and glyphs into this spec as changes; Save keeps them.")
+        "Copy the live talents and glyphs into this spec as changes; Save keeps them.")
     panel.useLive:SetPoint("LEFT", panel.load, "RIGHT", 2, 0)
     panel.useLive:SetScript("OnClick", function() TM:UseLive() end)
 
@@ -276,6 +359,13 @@ function Specs:Update()
     if not panel then
         return
     end
+    UpdatePicker()
+    if not next(TM:LoadTrees()) then
+        for _, row in ipairs(rows) do
+            row:Hide()
+        end
+        return
+    end
     local draft = TM.draft
     local rowCount = math.max(2, math.floor((panel.height - LIST_TOP - BUTTONS_HEIGHT - 16) / ROW_HEIGHT))
     local specRows = rowCount - 1
@@ -290,7 +380,7 @@ function Specs:Update()
     FillRow(rows[1] or MakeRow(1), "live", DraftIcon(live), liveName, TM:Split(live),
         draft and draft.source == "live")
 
-    local group = GetActiveTalentGroup(false, false)
+    local group = TM:ActiveGroup()
     local otherGroup = group == 1 and 2 or 1
     local loaded = TM:LoadedSpec()
     local liveDiffers = loaded and TM:LiveDiffers(loaded)
@@ -304,7 +394,7 @@ function Specs:Update()
             local sub = TM:Split(specDraft)
             if spec == loaded then
                 sub = sub .. (liveDiffers and "  |cffffa000Active, changed|r" or "  |cff40ff40Active|r")
-            elseif GetNumTalentGroups(false, false) > 1 and TM.loaded[otherGroup] == spec.id then
+            elseif TM:NumGroups() > 1 and TM.loaded[otherGroup] == spec.id then
                 sub = sub .. "  |cff9d9d9d" .. (otherGroup == 2 and (TALENT_SPEC_SECONDARY or "Secondary")
                     or (TALENT_SPEC_PRIMARY or "Primary")) .. "|r"
             end
@@ -340,8 +430,8 @@ function Specs:Update()
     end
     SetEnabled(panel.useLive, online and spec ~= nil and spec == loaded and liveDiffers and not draft.dirty)
     if spec and spec == loaded then
-        panel.note:SetText(liveDiffers and "Your live talents or glyphs differ from this spec: Load puts them back, "
-            .. "Use live copies them in." or "On your character now.")
+        panel.note:SetText(liveDiffers and "The live talents or glyphs differ from this spec: Load puts them back, "
+            .. "Use live copies them in." or ("On " .. TM:Subject() .. " now."))
     else
         panel.note:SetText("")
     end
@@ -358,3 +448,4 @@ end
 TM:On("WINDOW", function() Specs:Update() end)
 TM:On("CAST", function() Specs:Update() end)
 TM:On("CASTSTOP", function() Specs:Update() end)
+TM:On("CHARACTERS", function() UpdatePicker() end)

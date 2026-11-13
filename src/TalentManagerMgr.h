@@ -19,10 +19,13 @@ class Player;
 namespace TalentManager
 {
     // Protocol version sent in INFO. The addon warns when it doesn't match its own.
-    constexpr uint32 PROTOCOL_VERSION = 4;
+    constexpr uint32 PROTOCOL_VERSION = 5;
     constexpr std::size_t MAX_NAME_LENGTH = 32;    // characters; talent_manager_spec.name is VARCHAR(32)
     constexpr uint8 GLYPH_SLOTS = MAX_GLYPH_SLOT_INDEX;
     constexpr uint8 TALENT_GROUPS = 2;              // dual spec (MAX_TALENT_SPECS)
+
+    // Action bars by button (0 to MAX_ACTION_BUTTONS - 1), as ActionButton::packedData: action | type << 24.
+    using Bars = std::map<uint8, uint32>;
 
     struct Spec
     {
@@ -31,6 +34,10 @@ namespace TalentManager
         std::string name;
         std::string talents;    // talent calculator link, shortest form (Talents::Encode)
         std::array<uint32, GLYPH_SLOTS> glyphs{};   // GlyphProperties.dbc ids by socket, 0 = empty
+        // The action bars the spec had when another spec was last loaded over it. A spec that was never left has
+        // none, and loading it keeps the bars you have.
+        Bars bars;
+        bool hasBars = false;
     };
 
     // One character's saved specs, kept in memory while the character is online.
@@ -50,6 +57,7 @@ namespace TalentManager
         float x = 0.0f;
         float y = 0.0f;
         float z = 0.0f;
+        bool bot = false;       // an altbot's: it follows its master, so moving doesn't stop it
     };
 
     class Mgr
@@ -68,7 +76,8 @@ namespace TalentManager
         // Runs a pending swap cast: cancels it on combat, moving or death, loads the spec when it ends.
         void OnUpdate(Player* player, uint32 diff);
 
-        // `body` is "CMD:payload", the text after the TMGR envelope.
+        // `body` is "CMD:payload", the text after the TMGR envelope, or "@<guid>|CMD:payload" for one of the player's
+        // altbots.
         void HandleAddonMessage(Player* player, std::string const& body);
 
     private:
@@ -76,6 +85,15 @@ namespace TalentManager
 
         void SendInfo(Player* player);
         void SendSpecs(Player* player);
+        // You and the online altbots you are master of, for the addon's character picker.
+        void SendCharacters(Player* viewer);
+        // The talent trees of the player's class, for an addon showing a character of another class.
+        void SendTrees(Player* player);
+        // The live talents and glyphs, for an addon that can't read them from the client (an altbot's).
+        void SendLive(Player* player);
+
+        // The altbot `guid` when `viewer` may manage its talents, else nullptr and an error sent to the viewer.
+        Player* ResolveBot(Player* viewer, uint32 guid);
 
         void HandleSave(Player* player, std::string_view payload);
         void HandleRename(Player* player, std::string_view payload);
@@ -101,6 +119,15 @@ namespace TalentManager
         void ApplyGlyphs(Player* player, Profile& profile, Spec const& spec, std::vector<uint32>& skipped,
             std::vector<uint32>& used);
         void MarkLoaded(Player* player, Profile& profile, uint32 specId);
+
+        // TalentManagerBars.cpp. Copies the live action bars into the spec (and the database). A button that is
+        // empty now because its spell isn't known keeps what the spec had there.
+        void StoreBars(Player* player, Spec& spec);
+        // The bars to put on when `spec` loads, if any: the other talent group's when the spec is loaded there,
+        // else the spec's own.
+        bool BarsFor(Player* player, Profile const& profile, Spec const& spec, Bars& bars);
+        // Puts the bars on the player. Buttons whose spell isn't known (yet) are left empty.
+        void ApplyBars(Player* player, Bars const& bars);
 
         // Checks a spec name: length, no protocol separators, not used by another spec of this character.
         bool CheckName(Player* player, Profile const& profile, std::string const& name, uint32 exceptId);

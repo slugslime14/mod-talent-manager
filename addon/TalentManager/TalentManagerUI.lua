@@ -449,7 +449,10 @@ local function Build()
     f:SetScript("OnShow", function()
         PlaySound("TalentScreenOpen")
         FitToScreen(f)
-        SetPortraitTexture(f.portrait, "player")
+        -- Altbots come and go: ask for the picker's list again.
+        if TM.serverSeen then
+            TM:WithState("self", function() TM:Send("CHARS") end)
+        end
         UI:Update()
     end)
     f:SetScript("OnHide", function()
@@ -470,8 +473,8 @@ end
 -- The stock prerequisite helper takes (tier, column, isLearnable, isPreviewLearnable) per prerequisite.
 local function PrereqArgs(talent)
     local args, n = {}, 0
-    for _, prereq in ipairs(talent.prereqs) do
-        local met = TM:Rank(TM.draft, prereq) >= prereq.maxRank
+    for k, prereq in ipairs(talent.prereqs) do
+        local met = TM:Rank(TM.draft, prereq) >= TM:PrereqNeed(talent, k)
         args[n + 1], args[n + 2], args[n + 3], args[n + 4] = prereq.tier, prereq.column, met, met
         n = n + 4
     end
@@ -659,9 +662,10 @@ function UI:ShowTalentTooltip(button)
         GameTooltip:AddLine(REQUIRES_TIER:format((talent.tier - 1) * TM.TIER_POINTS, TM.trees[talent.tree].name),
             RED_FONT_COLOR.r, RED_FONT_COLOR.g, RED_FONT_COLOR.b)
     elseif blocker == "prereq" then
-        for _, prereq in ipairs(talent.prereqs) do
-            if TM:Rank(draft, prereq) < prereq.maxRank then
-                GameTooltip:AddLine(REQUIRES_PREREQ:format(prereq.maxRank, prereq.name),
+        for k, prereq in ipairs(talent.prereqs) do
+            local need = TM:PrereqNeed(talent, k)
+            if TM:Rank(draft, prereq) < need then
+                GameTooltip:AddLine(REQUIRES_PREREQ:format(need, prereq.name),
                     RED_FONT_COLOR.r, RED_FONT_COLOR.g, RED_FONT_COLOR.b)
             end
         end
@@ -787,12 +791,51 @@ end
 -- ---------------------------------------------------------------------------------------------------------------
 -- Whole-window update
 
+-- Your portrait, or the altbot's when it's in your party, else its class icon.
+local function UpdatePortrait(f)
+    local char = TM.char
+    if not char then
+        SetPortraitTexture(f.portrait, "player")
+        f.portrait:SetTexCoord(0, 1, 0, 1)
+        return
+    end
+    local count, prefix = GetNumRaidMembers(), "raid"
+    if count == 0 then
+        count, prefix = GetNumPartyMembers(), "party"
+    end
+    for i = 1, count do
+        local unit = prefix .. i
+        if UnitName(unit) == char.name then
+            SetPortraitTexture(f.portrait, unit)
+            f.portrait:SetTexCoord(0, 1, 0, 1)
+            return
+        end
+    end
+    local coords = CLASS_ICON_TCOORDS and CLASS_ICON_TCOORDS[TM.CLASS_TOKENS[char.class] or ""]
+    if coords then
+        f.portrait:SetTexture("Interface\\TargetingFrame\\UI-Classes-Circles")
+        f.portrait:SetTexCoord(unpack(coords))
+    else
+        f.portrait:SetTexture("Interface\\Icons\\INV_Misc_QuestionMark")
+        f.portrait:SetTexCoord(0, 1, 0, 1)
+    end
+end
+
 function UI:Update()
     local f = frame
     if not f or not f:IsShown() then
         return
     end
+    UpdatePortrait(f)
+    f.title:SetText(TM.char and ((TALENTS or "Talents") .. ": " .. TM.char.name) or TALENTS)
     local trees = TM:LoadTrees()
+    if not trees[1] then
+        -- Can't happen for a character that is shown (the switch waits for its trees); stay safe anyway.
+        f.treeArea:Hide()
+        f.statusText:SetText("Waiting for the server...")
+        TM:Fire("WINDOW")
+        return
+    end
     if not TM.draft then
         TM.draft = TM:LiveDraft()
     end
@@ -838,8 +881,8 @@ function UI:Update()
         leftColor .. left .. FONT_COLOR_CODE_CLOSE)
 
     local name = TM:DraftName(draft)
-    if draft.source == "live" and GetNumTalentGroups(false, false) > 1 then
-        local group = GetActiveTalentGroup(false, false)
+    if draft.source == "live" and TM:NumGroups() > 1 then
+        local group = TM:ActiveGroup()
         name = name .. " (" .. (group == 2 and (TALENT_SPEC_SECONDARY or "Secondary")
             or (TALENT_SPEC_PRIMARY or "Primary")) .. ")"
     end
@@ -922,3 +965,5 @@ TM:On("SHOW", function() UI:Show() end)
 TM:On("DRAFT", function() UI:Update() end)
 TM:On("INFO", function() UI:Update() end)
 TM:On("SPECS", function() UI:Update() end)
+TM:On("CHARACTER", function() UI:Update() end)
+TM:On("CHARACTERS", function() UI:Update() end)

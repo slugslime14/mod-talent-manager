@@ -3,13 +3,19 @@
 -- The talent trees are read from the client's own data (GetTalentInfo and friends). A spec being edited is a
 -- "draft": ranks per (tree, talent index). It can be written as the Wowhead / playerbots link format.
 -- Saved specs live on the server, per character; the addon keeps the last list it was sent (TM.specs).
+--
+-- The window shows one character at a time: you, or one of your online altbots (TM.char). Everything about the
+-- shown character is in the fields listed in STATE_KEYS; the other characters' copies wait in TM.states. Requests
+-- about an altbot are sent as "@<guid>|CMD:payload" and the server tags its answers the same way. An altbot's trees,
+-- live talents and glyphs come from the server, since the client only knows your own.
 
 TalentManager = {
     PREFIX = "TMGR",
-    PROTOCOL = 4,
+    PROTOCOL = 5,
     TIER_POINTS = 5,        -- points needed in a tree per row (PLAYER_TALENTS_PER_TIER)
     GLYPH_SLOTS = 6,
-    info = nil,             -- the server's INFO: { version, maxSpecs, castMs, points, activeGroup, groups }
+    info = nil,             -- the server's INFO: { version, maxSpecs, castMs, points, activeGroup, groups, level,
+                            -- class }
     trees = nil,            -- the class's talent trees, see LoadTrees
     -- The build shown in the window: { ranks = { [tree] = { [index] = rank } }, glyphs = { [socket] = id },
     -- source = "live" | "new" | "spec", specId, dirty }. "new" is a build not saved yet (New, Import).
@@ -23,10 +29,54 @@ TalentManager = {
     glyphs = nil,
     glyphById = {},
     glyphBySpell = {},
+    char = nil,             -- the altbot shown: { guid, name, class, level }; nil for yourself
+    live = nil,             -- an altbot's live build from the server: { talents (link), glyphs = { [socket] = id } }
+    ready = nil,            -- an altbot's state got its spec list (and so its trees and live build before it)
     listeners = {},
+
+    -- Not per character:
+    characters = {},        -- you and your online altbots, from CHARS: { guid, name, class, level }, you first
+    selfGuid = nil,
+    states = {},            -- the characters not shown: ["self"] or [guid] = their STATE_KEYS fields
+    pending = nil,          -- the guid of an altbot asked for, shown once its data is in
+    classTrees = {},        -- [class id] = trees the server sent
+    clientTrees = nil,      -- your class's trees from the client
 }
 
 local TM = TalentManager
+
+-- The fields that belong to the shown character.
+local STATE_KEYS = { "char", "info", "trees", "draft", "specs", "specById", "loaded", "casting", "glyphs",
+    "glyphById", "glyphBySpell", "maxSpecs", "listed", "pendingSelect", "live", "ready" }
+
+TM.CLASS_TOKENS = { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST", "DEATHKNIGHT", "SHAMAN", "MAGE", "WARLOCK",
+    nil, "DRUID" }
+
+-- Tree names, backgrounds and icons by class id and tab, from TalentTab.dbc (the client only tells you your own).
+local TREE_INFO = {
+    [1] = { { "Arms", "WarriorArms", "Ability_Rogue_Eviscerate" },
+        { "Fury", "WarriorFury", "Ability_Warrior_InnerRage" },
+        { "Protection", "WarriorProtection", "INV_Shield_06" } },
+    [2] = { { "Holy", "PaladinHoly", "Spell_Holy_HolyBolt" }, { "Protection", "PaladinProtection",
+        "Spell_Holy_DevotionAura" }, { "Retribution", "PaladinCombat", "Spell_Holy_AuraOfLight" } },
+    [3] = { { "Beast Mastery", "HunterBeastMastery", "Ability_Hunter_BeastTaming" },
+        { "Marksmanship", "HunterMarksmanship", "Ability_Marksmanship" },
+        { "Survival", "HunterSurvival", "Ability_Hunter_SwiftStrike" } },
+    [4] = { { "Assassination", "RogueAssassination", "Ability_Rogue_Eviscerate" }, { "Combat", "RogueCombat",
+        "Ability_BackStab" }, { "Subtlety", "RogueSubtlety", "Ability_Stealth" } },
+    [5] = { { "Discipline", "PriestDiscipline", "Spell_Holy_WordFortitude" }, { "Holy", "PriestHoly",
+        "Spell_Holy_GuardianSpirit" }, { "Shadow", "PriestShadow", "Spell_Shadow_ShadowWordPain" } },
+    [6] = { { "Blood", "DeathKnightBlood", "Spell_Deathknight_BloodPresence" }, { "Frost", "DeathKnightFrost",
+        "Spell_Deathknight_FrostPresence" }, { "Unholy", "DeathKnightUnholy", "Spell_Deathknight_UnholyPresence" } },
+    [7] = { { "Elemental", "ShamanElementalCombat", "Spell_Nature_Lightning" }, { "Enhancement", "ShamanEnhancement",
+        "Spell_Nature_LightningShield" }, { "Restoration", "ShamanRestoration", "Spell_Nature_MagicImmunity" } },
+    [8] = { { "Arcane", "MageArcane", "Spell_Holy_MagicalSentry" }, { "Fire", "MageFire", "Spell_Fire_FireBolt02" },
+        { "Frost", "MageFrost", "Spell_Frost_FrostBolt02" } },
+    [9] = { { "Affliction", "WarlockCurses", "Spell_Shadow_DeathCoil" }, { "Demonology", "WarlockSummoning",
+        "Spell_Shadow_Metamorphosis" }, { "Destruction", "WarlockDestruction", "Spell_Shadow_RainOfFire" } },
+    [11] = { { "Balance", "DruidBalance", "Spell_Nature_StarFall" }, { "Feral Combat", "DruidFeralCombat",
+        "Ability_Racial_BearForm" }, { "Restoration", "DruidRestoration", "Spell_Nature_HealingTouch" } },
+}
 
 local DEFAULTS = {
     point = nil,            -- the window's position: { point, x, y }
@@ -40,8 +90,14 @@ function TM:On(event, callback)
     table.insert(self.listeners[event], callback)
 end
 
--- A listener that fails is reported (the game's error handler) and the others still run.
+-- A listener that fails is reported (the game's error handler) and the others still run. While a message about a
+-- character that isn't shown is handled (TM.quiet), only the cast bar's events go out: the window shows someone else.
+local LOUD = { BAR = true }
+
 function TM:Fire(event, ...)
+    if self.quiet and not LOUD[event] then
+        return
+    end
     for _, callback in ipairs(self.listeners[event] or {}) do
         local ok, err = pcall(callback, ...)
         if not ok then
@@ -52,6 +108,165 @@ end
 
 function TM:Print(text)
     DEFAULT_CHAT_FRAME:AddMessage("|cff4e96f7[Talents]|r " .. text)
+end
+
+-- A message about the character the current state belongs to: an altbot's start with its name.
+function TM:Say(text)
+    local name = self.char and self.char.name
+    local plain = text:gsub("|c%x%x%x%x%x%x%x%x", "")
+    if name and plain:sub(1, #name) ~= name then
+        text = name .. ": " .. text
+    end
+    self:Print(text)
+end
+
+-- "your character" or the altbot's name, for tooltips.
+function TM:Subject()
+    return self.char and self.char.name or "your character"
+end
+
+-- "your bags" or "<altbot>'s bags".
+function TM:Bags()
+    return self.char and (self.char.name .. "'s bags") or "your bags"
+end
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- Characters: you or an altbot
+
+local function StateKey()
+    return TM.char and TM.char.guid or "self"
+end
+TM.StateKey = StateKey
+
+function TM:CharacterByGuid(guid)
+    for _, character in ipairs(self.characters) do
+        if character.guid == guid then
+            return character
+        end
+    end
+end
+
+local function SaveState()
+    local state = {}
+    for _, key in ipairs(STATE_KEYS) do
+        state[key] = TM[key]
+    end
+    TM.states[StateKey()] = state
+end
+
+local function LoadState(key)
+    local state = TM.states[key]
+    if not state then
+        local char = nil
+        if key ~= "self" then
+            char = TM:CharacterByGuid(key) or { guid = key, name = "#" .. key, class = 0, level = 0 }
+        end
+        state = { char = char, specs = {}, specById = {}, loaded = {}, glyphById = {}, glyphBySpell = {} }
+    end
+    for _, k in ipairs(STATE_KEYS) do
+        TM[k] = state[k]
+    end
+end
+
+-- Runs fn with the state of character `key` ("self" or a guid) in place, without drawing anything if that isn't
+-- the shown character.
+function TM:WithState(key, fn, ...)
+    if key == StateKey() then
+        return fn(...)
+    end
+    local shown, quiet = StateKey(), self.quiet
+    SaveState()
+    LoadState(key)
+    self.quiet = true
+    local ok, err = pcall(fn, ...)
+    SaveState()
+    LoadState(shown)
+    self.quiet = quiet
+    if not ok then
+        geterrorhandler()(err)
+    end
+end
+
+local function SwitchTo(key)
+    TM.pending = nil
+    if key == StateKey() then
+        return
+    end
+    SaveState()
+    LoadState(key)
+    if not TM.draft and next(TM:LoadTrees()) then
+        TM.draft = TM:LiveDraft()
+    end
+    TM:Fire("CHARACTER")
+    TM:Fire("DRAFT")
+end
+
+local function PlayerClassId()
+    local _, token = UnitClass("player")
+    for id, t in pairs(TM.CLASS_TOKENS) do
+        if t == token then
+            return id
+        end
+    end
+end
+
+-- Shows you (guid nil or your own) or an altbot in the window. An altbot seen before shows at once and its data is
+-- asked for again; one seen for the first time shows once the server has sent it all.
+function TM:ShowCharacter(guid)
+    if guid == self.selfGuid then
+        guid = nil
+    end
+    if not guid then
+        self.pending = nil
+        SwitchTo("self")
+        return
+    end
+    if guid == StateKey() then
+        return
+    end
+    local character = self:CharacterByGuid(guid)
+    self:WithState(guid, function()
+        if character then
+            TM.char = character
+        end
+        TM.listed = true
+        TM:Send("HELLO")
+        if not TM.trees then
+            if TM.classTrees[TM.char.class] then
+                TM.trees = TM.classTrees[TM.char.class]
+            elseif TM.char.class == PlayerClassId() then
+                TM.trees = TM:ClientTrees()
+            else
+                TM:Send("TREES")
+            end
+        end
+        TM:Send("LIVE")
+        TM:Send("GLYPHS")
+        TM:Send("LIST")
+    end)
+    local state = self.states[guid]
+    if state and state.ready then
+        SwitchTo(guid)
+    else
+        self.pending = guid
+        self.pendingSince = GetTime()
+        self:Fire("CHARACTER")
+    end
+end
+
+-- The talent group, group count, point total and glyph sockets of the shown character.
+function TM:ActiveGroup()
+    if self.char then
+        return self.info and self.info.activeGroup or 1
+    end
+    return GetActiveTalentGroup(false, false)
+end
+
+function TM:NumGroups()
+    if self.char then
+        return self.info and self.info.groups or 1
+    end
+    return GetNumTalentGroups(false, false)
 end
 
 -- ---------------------------------------------------------------------------------------------------------------
@@ -72,9 +287,25 @@ local function CollectPrereqs(...)
     return list
 end
 
+-- The shown character's trees. An altbot's come from the server (TREE messages), unless it's your class. Until they
+-- are in this is an empty list.
 function TM:LoadTrees()
     if self.trees then
         return self.trees
+    end
+    if self.char then
+        self.trees = self.classTrees[self.char.class]
+            or (self.char.class == PlayerClassId() and self:ClientTrees()) or nil
+        return self.trees or {}
+    end
+    self.trees = self:ClientTrees()
+    return self.trees
+end
+
+-- Your class's trees from the client's own data.
+function TM:ClientTrees()
+    if self.clientTrees then
+        return self.clientTrees
     end
 
     local trees = {}
@@ -122,8 +353,57 @@ function TM:LoadTrees()
         trees[t] = tree
     end
 
-    self.trees = trees
+    self.clientTrees = trees
     return trees
+end
+
+-- Trees from the server's TREE entries (in link order). Names and pictures come from TREE_INFO, talent names and
+-- icons from the talents' first rank spells.
+local function ServerTrees(classId, entries)
+    local trees, byId = {}, {}
+    local info = TREE_INFO[classId] or {}
+    for t = 1, 3 do
+        local i = info[t] or {}
+        trees[t] = { index = t, name = i[1] or ("Tree " .. t), background = i[2],
+            icon = i[3] and ("Interface\\Icons\\" .. i[3]) or "Interface\\Icons\\INV_Misc_QuestionMark",
+            talents = {}, order = {}, maxTier = 0 }
+    end
+    for _, e in ipairs(entries) do
+        local tree = trees[e.tree]
+        if tree then
+            local index = #tree.order + 1
+            local name, _, icon = GetSpellInfo(e.spell)
+            local talent = {
+                tree = e.tree, index = index, id = e.id, name = name or ("Talent " .. e.id),
+                icon = icon or "Interface\\Icons\\INV_Misc_QuestionMark", tier = e.row + 1, column = e.column + 1,
+                maxRank = e.maxRank, prereqs = {}, dependents = {}, dependsOn = e.dependsOn,
+                dependsOnRank = e.dependsOnRank,
+            }
+            tree.talents[index] = talent
+            tree.order[index] = talent
+            byId[e.id] = talent
+            if talent.tier > tree.maxTier then
+                tree.maxTier = talent.tier
+            end
+        end
+    end
+    for _, tree in ipairs(trees) do
+        for _, talent in ipairs(tree.order) do
+            local prereq = talent.dependsOn ~= 0 and byId[talent.dependsOn]
+            if prereq then
+                talent.prereqs[1] = prereq
+                talent.prereqRanks = { talent.dependsOnRank + 1 }
+                prereq.dependents[#prereq.dependents + 1] = talent
+            end
+        end
+    end
+    return trees
+end
+
+-- Points a talent needs in its k-th prerequisite: the server's rule (DependsOnRank + 1) when known, else the
+-- prerequisite's top rank, as the stock talent frame shows it.
+function TM:PrereqNeed(talent, k)
+    return talent.prereqRanks and talent.prereqRanks[k] or talent.prereqs[k].maxRank
 end
 
 -- ---------------------------------------------------------------------------------------------------------------
@@ -140,8 +420,15 @@ function TM:NewDraft()
     return draft
 end
 
--- Your live talents in the active talent group.
+-- The live talents in the active talent group: yours from the client, an altbot's from the server.
 function TM:LiveDraft()
+    if self.char then
+        local draft = (self.live and self:DecodeDraft(self.live.talents)) or self:NewDraft()
+        draft.source = "live"
+        draft.dirty = false
+        draft.glyphs = self:LiveGlyphs()
+        return draft
+    end
     local draft = self:NewDraft()
     draft.source = "live"
     local group = GetActiveTalentGroup(false, false)
@@ -189,6 +476,9 @@ end
 
 -- Talent points the character has in all: unspent plus spent in the active talent group.
 function TM:AvailablePoints()
+    if self.char then
+        return self.info and self.info.points or 0
+    end
     local group = GetActiveTalentGroup(false, false)
     local total = GetUnspentTalentPoints(false, false, group) or 0
     for t = 1, GetNumTalentTabs(false, false) do
@@ -198,8 +488,8 @@ function TM:AvailablePoints()
 end
 
 function TM:PrereqsMet(draft, talent)
-    for _, prereq in ipairs(talent.prereqs) do
-        if self:Rank(draft, prereq) < prereq.maxRank then
+    for k, prereq in ipairs(talent.prereqs) do
+        if self:Rank(draft, prereq) < self:PrereqNeed(talent, k) then
             return false
         end
     end
@@ -368,18 +658,31 @@ local GLYPH_ICONS = {
 }
 TM.GLYPH_RUNE = "Interface\\Spellbook\\UI-Glyph-Rune1"
 
--- The level each socket opens at (Spell::EffectApplyGlyph, Player::InitGlyphsForLevel).
+-- The level each socket opens at (Spell::EffectApplyGlyph, Player::InitGlyphsForLevel), and its type (GlyphSlot.dbc:
+-- 1 major, 2 minor).
 TM.SOCKET_LEVELS = { 15, 15, 50, 30, 70, 80 }
+TM.SOCKET_TYPES = { 1, 2, 2, 1, 2, 1 }
 
--- enabled, type (1 major, 2 minor) of a socket for your character.
+-- enabled, type (1 major, 2 minor) of a socket for the shown character.
 function TM:SocketInfo(socket)
+    if self.char then
+        local level = self.info and self.info.level or self.char.level or 0
+        return level >= self.SOCKET_LEVELS[socket], self.SOCKET_TYPES[socket]
+    end
     local enabled, glyphType = GetGlyphSocketInfo(socket)
     return enabled and true or false, glyphType
 end
 
--- The glyph ids in your sockets now (active talent group), 0 for empty or unknown to the list.
+-- The glyph ids in the sockets now (active talent group), 0 for empty or unknown to the list.
 function TM:LiveGlyphs()
     local glyphs = {}
+    if self.char then
+        for socket = 1, self.GLYPH_SLOTS do
+            local id = self.live and self.live.glyphs[socket] or 0
+            glyphs[socket] = self.glyphById[id] and id or 0
+        end
+        return glyphs
+    end
     for socket = 1, self.GLYPH_SLOTS do
         local spell = select(3, GetGlyphSocketInfo(socket))
         local glyph = spell and self.glyphBySpell[spell]
@@ -388,11 +691,20 @@ function TM:LiveGlyphs()
     return glyphs
 end
 
--- "known": free to put in. "bags": a load uses up one of the glyph items in your bags. "none": neither.
+-- How many of the glyph's item the shown character carries: your bags as they are now, an altbot's as the server
+-- last counted them.
+function TM:GlyphBagCount(glyph)
+    if self.char then
+        return glyph.bags or 0
+    end
+    return GetItemCount(glyph.itemId)
+end
+
+-- "known": free to put in. "bags": a load uses up one of the glyph items in the bags. "none": neither.
 function TM:GlyphState(glyph)
     if glyph.known then
         return "known"
-    elseif GetItemCount(glyph.itemId) > 0 then
+    elseif self:GlyphBagCount(glyph) > 0 then
         return "bags"
     end
     return "none"
@@ -530,8 +842,10 @@ end
 -- ---------------------------------------------------------------------------------------------------------------
 -- Server messages
 
+-- A request about the shown character (the state in place): an altbot's carry its guid.
 function TM:Send(command, payload)
-    SendAddonMessage(self.PREFIX, command .. ":" .. (payload or ""), "WHISPER", UnitName("player"))
+    local tag = self.char and ("@" .. self.char.guid .. "|") or ""
+    SendAddonMessage(self.PREFIX, tag .. command .. ":" .. (payload or ""), "WHISPER", UnitName("player"))
 end
 
 local function Split(text, sep)
@@ -544,7 +858,7 @@ end
 
 local handlers = {}
 
--- INFO:version,maxSpecs,swapCastMs,talentPoints,activeGroup,groupCount
+-- INFO:version,maxSpecs,swapCastMs,talentPoints,activeGroup,groupCount,level,class
 function handlers.INFO(payload)
     local f = Split(payload, ",")
     TM.info = {
@@ -554,7 +868,13 @@ function handlers.INFO(payload)
         points = tonumber(f[4]) or 0,
         activeGroup = tonumber(f[5]) or 1,
         groups = tonumber(f[6]) or 1,
+        level = tonumber(f[7]),
+        class = tonumber(f[8]),
     }
+    TM.serverSeen = true
+    if TM.char and TM.info.level then
+        TM.char.level = TM.info.level
+    end
     if TM.info.version ~= TM.PROTOCOL and not TM.warnedVersion then
         TM.warnedVersion = true
         TM:Print(("The server's mod-talent-manager speaks version %d, this addon %d. Update the one that's older.")
@@ -565,19 +885,118 @@ function handlers.INFO(payload)
         TM:Send("LIST")
         TM:Send("GLYPHS")
     end
+    if not TM.char then
+        TM:Send("CHARS")
+    end
     TM:Fire("INFO")
 end
 
 function handlers.ERR(payload)
-    TM:Print("|cffff4040" .. payload .. "|r")
+    TM:Say("|cffff4040" .. payload .. "|r")
 end
 
 function handlers.MSG(payload)
-    TM:Print(payload)
+    TM:Say(payload)
 end
 
--- The spec list: SPECBEGIN:count,max,loaded1,loaded2, SPEC: entries "id,sort,name,talents,glyph1..glyph6" (';'
--- separated), SPECEND:.
+-- Your characters for the picker: CHARBEGIN:, CHAR: entries "guid,name,class,level" (you first), CHAREND:. Never
+-- tagged: it's about you.
+local incomingChars
+
+function handlers.CHARBEGIN()
+    incomingChars = {}
+end
+
+function handlers.CHAR(payload)
+    if not incomingChars then
+        return
+    end
+    for _, entry in ipairs(Split(payload, ";")) do
+        local f = Split(entry, ",")
+        local guid = tonumber(f[1])
+        if guid then
+            incomingChars[#incomingChars + 1] = { guid = guid, name = f[2] or "?", class = tonumber(f[3]) or 0,
+                level = tonumber(f[4]) or 0 }
+        end
+    end
+end
+
+function handlers.CHAREND()
+    if not incomingChars then
+        return
+    end
+    TM.characters, incomingChars = incomingChars, nil
+    TM.selfGuid = TM.characters[1] and TM.characters[1].guid
+    -- States keep the same tables, so levels and names stay current there too.
+    for _, character in ipairs(TM.characters) do
+        local state = TM.states[character.guid]
+        if state and state.char then
+            state.char.level, state.char.name = character.level, character.name
+        end
+    end
+    -- The altbot shown logged out or got another master: back to you.
+    if TM.char and not TM:CharacterByGuid(TM.char.guid) then
+        TM:Print(("%s isn't one of your online altbots any more."):format(TM.char.name))
+        TM:ShowCharacter(nil)
+    end
+    if TM.pending and not TM:CharacterByGuid(TM.pending) then
+        TM.pending = nil
+    end
+    TM:Fire("CHARACTERS")
+end
+
+-- An altbot's talent trees: TREEBEGIN:class, TREE: entries "tree,talentId,row,column,maxRank,spell,dependsOn,
+-- dependsOnRank", TREEEND:class.
+local incomingTrees
+
+function handlers.TREEBEGIN()
+    incomingTrees = {}
+end
+
+function handlers.TREE(payload)
+    if not incomingTrees then
+        return
+    end
+    for _, entry in ipairs(Split(payload, ";")) do
+        local f = Split(entry, ",")
+        local id = tonumber(f[2])
+        if id then
+            incomingTrees[#incomingTrees + 1] = { tree = tonumber(f[1]) or 0, id = id, row = tonumber(f[3]) or 0,
+                column = tonumber(f[4]) or 0, maxRank = tonumber(f[5]) or 1, spell = tonumber(f[6]) or 0,
+                dependsOn = tonumber(f[7]) or 0, dependsOnRank = tonumber(f[8]) or 0 }
+        end
+    end
+end
+
+function handlers.TREEEND(payload)
+    if not incomingTrees then
+        return
+    end
+    local classId = tonumber(payload) or 0
+    TM.classTrees[classId] = ServerTrees(classId, incomingTrees)
+    incomingTrees = nil
+    if TM.char and TM.char.class == classId then
+        TM.trees = TM.classTrees[classId]
+    end
+end
+
+-- An altbot's live build: LIVE:talents,glyph1..glyph6.
+function handlers.LIVE(payload)
+    local f = Split(payload, ",")
+    local live = { talents = f[1] or "", glyphs = {} }
+    for socket = 1, TM.GLYPH_SLOTS do
+        live.glyphs[socket] = tonumber(f[1 + socket]) or 0
+    end
+    TM.live = live
+    local draft = TM.draft
+    if draft and draft.source == "live" and not draft.dirty and TM.trees then
+        TM.draft = TM:LiveDraft()
+    end
+    TM:Fire("DRAFT")
+end
+
+-- The spec list: SPECBEGIN:count,max,loaded1,loaded2, SPEC: entries "id,sort,name,talents,glyph1..glyph6,bars"
+-- (';' separated; bars 1 when the spec has action bars saved), SPECEND:.
 local incoming
 
 function handlers.SPECBEGIN(payload)
@@ -602,6 +1021,7 @@ function handlers.SPEC(payload)
             for socket = 1, TM.GLYPH_SLOTS do
                 spec.glyphs[socket] = tonumber(f[4 + socket]) or 0
             end
+            spec.hasBars = f[5 + TM.GLYPH_SLOTS] == "1"
             incoming[#incoming + 1] = spec
         end
     end
@@ -634,11 +1054,15 @@ function handlers.SPECEND()
         TM:Select("live")
     end
     TM.pendingSelect = nil
+    if not TM.draft and next(TM:LoadTrees()) then
+        TM.draft = TM:LiveDraft()
+    end
+    TM.ready = true
     TM:Fire("SPECS")
 end
 
--- The class's glyphs: GLYPHBEGIN:count, GLYPH: entries "id,spellId,type,itemId,iconId,known" (';' separated; type
--- 0 major, 1 minor), GLYPHEND:.
+-- The class's glyphs: GLYPHBEGIN:count, GLYPH: entries "id,spellId,type,itemId,iconId,known,bags" (';' separated;
+-- type 0 major, 1 minor; bags: how many of its item the character carries), GLYPHEND:.
 local incomingGlyphs
 
 function handlers.GLYPHBEGIN()
@@ -656,7 +1080,7 @@ function handlers.GLYPH(payload)
             incomingGlyphs[#incomingGlyphs + 1] = {
                 id = id, spellId = spellId, type = (tonumber(f[3]) or 0) + 1, itemId = tonumber(f[4]) or 0,
                 icon = GLYPH_ICONS[tonumber(f[5]) or 0] or TM.GLYPH_RUNE, known = f[6] == "1",
-                name = GetSpellInfo(spellId) or ("Glyph " .. id),
+                bags = tonumber(f[7]) or 0, name = GetSpellInfo(spellId) or ("Glyph " .. id),
             }
         end
     end
@@ -691,14 +1115,18 @@ end
 function handlers.CAST(payload)
     local f = Split(payload, ",")
     TM.casting = { specId = tonumber(f[2]), started = GetTime(), duration = (tonumber(f[1]) or 0) / 1000 }
+    local spec = TM.specById[TM.casting.specId]
     TM:Fire("CAST")
+    TM:Fire("BAR", "start", StateKey(), (TM.char and (TM.char.name .. ": ") or "") .. "Loading "
+        .. (spec and spec.name or "spec"), TM.casting.duration)
 end
 
+-- %s is "You" or the altbot's name.
 local STOP_REASONS = {
-    moved = "You moved.",
-    combat = "You entered combat.",
-    dead = "You died.",
-    cast = "You started casting.",
+    moved = "%s moved.",
+    combat = "%s entered combat.",
+    dead = "%s died.",
+    cast = "%s started casting.",
     stopped = "Stopped.",
     deleted = "The spec was deleted.",
 }
@@ -708,10 +1136,11 @@ function handlers.CASTSTOP(payload)
     local casting = TM.casting
     TM.casting = nil
     TM:Fire("CASTSTOP", payload)
+    TM:Fire("BAR", "stop", StateKey())
     if payload ~= "failed" then
         local spec = casting and TM.specById[casting.specId]
-        TM:Print(("Loading %s stopped: %s"):format(spec and spec.name or "the spec",
-            STOP_REASONS[payload] or payload))
+        local reason = (STOP_REASONS[payload] or payload):format(TM.char and TM.char.name or "You")
+        TM:Say(("Loading %s stopped: %s"):format(spec and spec.name or "the spec", reason))
     end
 end
 
@@ -725,27 +1154,30 @@ local function GlyphNames(list)
     return names
 end
 
--- LOADED:id,missing,skipped,used: the spec is on the character now. skipped and used are glyph ids joined by '/':
--- glyphs that couldn't go in, and glyphs inscribed from an item in the bags. The list follows.
+-- LOADED:id,missing,skipped,used,bars: the spec is on the character now. skipped and used are glyph ids joined by
+-- '/': glyphs that couldn't go in, and glyphs inscribed from an item in the bags. bars is 1 when the spec's action
+-- bars were put on. The list follows.
 function handlers.LOADED(payload)
     local f = Split(payload, ",")
     local id, missing = tonumber(f[1]), tonumber(f[2]) or 0
     local skipped, used = GlyphNames(f[3]), GlyphNames(f[4])
+    local bars = f[5] == "1"
     TM.casting = nil
-    TM:Fire("LOADED", id)
+    TM:Fire("SPECLOADED", id)
+    TM:Fire("BAR", "done", StateKey())
     local spec = id and TM.specById[id]
-    local name = spec and spec.name or "the spec"
+    local name = (spec and spec.name or "the spec") .. (bars and " with its action bars" or "")
     if missing > 0 then
-        TM:Print(("Loaded %s, but %d talents didn't take. The server log has details."):format(name, missing))
+        TM:Say(("Loaded %s, but %d talents didn't take. The server log has details."):format(name, missing))
     else
-        TM:Print(("Loaded %s."):format(name))
+        TM:Say(("Loaded %s."):format(name))
     end
     if #used > 0 then
-        TM:Print(("Used from your bags, known from now on: %s."):format(table.concat(used, ", ")))
+        TM:Say(("Used from %s, known from now on: %s."):format(TM:Bags(), table.concat(used, ", ")))
     end
     if #skipped > 0 then
-        TM:Print(("Left out: %s. Not known and none in your bags, or the socket isn't open yet.")
-            :format(table.concat(skipped, ", ")))
+        TM:Say(("Left out: %s. Not known and none in %s, or the socket isn't open yet.")
+            :format(table.concat(skipped, ", "), TM:Bags()))
     end
     -- Show it, unchanged, once the list arrives.
     TM.pendingSelect = id
@@ -790,7 +1222,7 @@ end
 
 -- The spec last loaded into the active talent group, if it still exists.
 function TM:LoadedSpec()
-    local id = self.loaded[GetActiveTalentGroup(false, false)]
+    local id = self.loaded[self:ActiveGroup()]
     return id and self.specById[id] or nil
 end
 
@@ -813,7 +1245,7 @@ function TM:LiveDiffers(spec)
 end
 
 function TM:LoadSpec(id)
-    if InCombatLockdown() then
+    if not self.char and InCombatLockdown() then
         self:Print("You can't change talents in combat.")
         return
     end
@@ -873,14 +1305,30 @@ function TM:Import(link)
     return true
 end
 
+-- Messages about you, whoever the window shows.
+local ABOUT_YOU = { CHARBEGIN = true, CHAR = true, CHAREND = true }
+
 local function OnAddonMessage(prefix, message, _, sender)
     if prefix ~= TM.PREFIX or sender ~= UnitName("player") then
         return
     end
+    local guid, rest = message:match("^@(%d+)|(.*)$")
+    if guid then
+        guid, message = tonumber(guid), rest
+    end
     local command, payload = message:match("^(%u+):(.*)$")
     local handler = command and handlers[command]
-    if handler then
+    if not handler then
+        return
+    end
+    if ABOUT_YOU[command] then
         handler(payload)
+        return
+    end
+    local key = guid or "self"
+    TM:WithState(key, handler, payload)
+    if TM.pending and TM.pending == key and TM.states[key] and TM.states[key].ready then
+        SwitchTo(key)
     end
 end
 
@@ -899,24 +1347,37 @@ events:RegisterEvent("GLYPH_ADDED")
 events:RegisterEvent("GLYPH_UPDATED")
 events:RegisterEvent("GLYPH_REMOVED")
 events:RegisterEvent("BAG_UPDATE")
+events:RegisterEvent("PARTY_MEMBERS_CHANGED")
 
--- Warn once if the server never answers HELLO. Bag changes are passed on at most twice a second.
-local helloSentAt, bagsChangedAt
+-- Warn once if the server never answers HELLO. Bag changes are passed on at most twice a second. An altbot asked for
+-- that never answers is given up on.
+local helloSentAt, bagsChangedAt, partyChangedAt
 events:SetScript("OnUpdate", function()
     if bagsChangedAt and GetTime() - bagsChangedAt > 0.5 then
         bagsChangedAt = nil
         TM:Fire("BAGS")
     end
+    if partyChangedAt and GetTime() - partyChangedAt > 1 then
+        partyChangedAt = nil
+        if TM.serverSeen then
+            TM:WithState("self", function() TM:Send("CHARS") end)
+        end
+    end
+    if TM.pending and GetTime() - (TM.pendingSince or 0) > 8 then
+        TM.pending = nil
+        TM:Fire("CHARACTER")
+    end
     if helloSentAt and GetTime() - helloSentAt > 10 then
         helloSentAt = nil
-        if not TM.info then
+        if not TM.serverSeen then
             TM:Print("The server doesn't answer: mod-talent-manager isn't installed or is disabled. "
                 .. "You can still plan talents, but saving and loading specs won't work.")
         end
     end
 end)
 
--- Your talents or point total changed. Unchanged live talents in the window follow them.
+-- Your talents or point total changed. Unchanged live talents in the window follow them. Runs with your state in
+-- place.
 local function OnLiveChanged()
     if not TM.trees then
         return
@@ -927,7 +1388,18 @@ local function OnLiveChanged()
     TM:Fire("DRAFT")
 end
 
-events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
+local OnEvent
+
+events:SetScript("OnEvent", function(_, event, ...)
+    -- Server messages say whom they are about. Game events are about you, whoever the window shows.
+    if event == "CHAT_MSG_ADDON" then
+        OnAddonMessage(...)
+    else
+        TM:WithState("self", OnEvent, event, ...)
+    end
+end)
+
+OnEvent = function(event, arg1, arg2, arg3, arg4)
     if event == "ADDON_LOADED" and arg1 == "TalentManager" then
         TalentManagerDB = TalentManagerDB or {}
         for key, value in pairs(DEFAULTS) do
@@ -935,16 +1407,16 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
                 TalentManagerDB[key] = value
             end
         end
-        TM:Fire("LOADED")
+        TM:Fire("ADDON")
     elseif event == "PLAYER_ENTERING_WORLD" then
         if not TM.info then
             TM:Send("HELLO")
             helloSentAt = helloSentAt or GetTime()
         end
-    elseif event == "CHAT_MSG_ADDON" then
-        OnAddonMessage(arg1, arg2, arg3, arg4)
     elseif event == "BAG_UPDATE" then
         bagsChangedAt = bagsChangedAt or GetTime()
+    elseif event == "PARTY_MEMBERS_CHANGED" then
+        partyChangedAt = partyChangedAt or GetTime()
     elseif event == "GLYPH_ADDED" or event == "GLYPH_UPDATED" or event == "GLYPH_REMOVED" then
         -- A glyph inscribed by hand becomes known.
         if TM.info and event ~= "GLYPH_REMOVED" then
@@ -959,7 +1431,7 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
     else
         OnLiveChanged()
     end
-end)
+end
 
 -- ---------------------------------------------------------------------------------------------------------------
 -- Slash commands
@@ -975,19 +1447,23 @@ SlashCmdList.TALENTMANAGER = function(text)
         TM:LoadTrees()
         TM:Print("Talent link: " .. TM:EncodeDraft(TM.draft or TM:LiveDraft()))
     elseif command == "load" then
-        local spec = TM:FindSpec(rest)
-        if spec then
-            TM:LoadSpec(spec.id)
-        else
-            TM:Print(("You have no spec called %s."):format(rest))
-        end
+        TM:WithState("self", function()
+            local spec = TM:FindSpec(rest)
+            if spec then
+                TM:LoadSpec(spec.id)
+            else
+                TM:Print(("You have no spec called %s."):format(rest))
+            end
+        end)
     elseif command == "debug" then
         local ui = TM.UI and TM.UI.frame
         local pane = _G["TalentManagerGlyphPane"]
-        TM:Print(("protocol %d, server %s, glyph file %s, glyphs %s, tab %s, glyph pane %s"):format(TM.PROTOCOL,
-            TM.info and tostring(TM.info.version) or "none", TM.GlyphPane and "loaded" or "NOT loaded",
-            TM.glyphs and tostring(#TM.glyphs) or "none", ui and tostring(PanelTemplates_GetSelectedTab(ui)) or "-",
-            pane and (pane:IsVisible() and "shown" or "hidden") or "none"))
+        TM:Print(("protocol %d, server %s, glyph file %s, glyphs %s, tab %s, glyph pane %s, shown %s, %d characters")
+            :format(TM.PROTOCOL, TM.info and tostring(TM.info.version) or "none",
+            TM.GlyphPane and "loaded" or "NOT loaded", TM.glyphs and tostring(#TM.glyphs) or "none",
+            ui and tostring(PanelTemplates_GetSelectedTab(ui)) or "-",
+            pane and (pane:IsVisible() and "shown" or "hidden") or "none", TM.char and TM.char.name or "you",
+            #TM.characters))
     elseif command == "import" then
         local ok, reason = TM:Import(rest)
         if not ok then

@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+class Player;
 struct TalentEntry;
 
 // A class's talent trees and builds written as talent calculator links: one digit per talent (its rank), talents in
@@ -36,6 +37,12 @@ namespace TalentManager::Talents
 
     // The link in its shortest form: trailing zeros and empty trailing trees left out.
     std::string Encode(Build const& build);
+
+    // The rank of a talent in the player's active talent group, 0 for none.
+    uint8 LiveRank(Player* player, TalentEntry const* talent);
+
+    // The player's talents in the active talent group.
+    Build Live(Player* player);
 }
 
 #endif

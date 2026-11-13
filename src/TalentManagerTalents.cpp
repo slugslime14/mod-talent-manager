@@ -1,5 +1,6 @@
 #include "TalentManagerTalents.h"
 #include "DBCStores.h"
+#include "Player.h"
 #include "SharedDefines.h"
 #include "StringFormat.h"
 #include <algorithm>
@@ -174,5 +175,26 @@ namespace TalentManager::Talents
             link += parts[t];
         }
         return link;
+    }
+
+    uint8 LiveRank(Player* player, TalentEntry const* talent)
+    {
+        for (int8 rank = MAX_TALENT_RANK - 1; rank >= 0; --rank)
+            if (talent->RankID[rank] && player->HasTalent(talent->RankID[rank], player->GetActiveSpec()))
+                return uint8(rank + 1);
+        return 0;
+    }
+
+    Build Live(Player* player)
+    {
+        Build build;
+        for (uint8 t = 0; t < TREES; ++t)
+        {
+            std::vector<TalentEntry const*> const& tree = Tree(player->getClass(), t);
+            build[t].resize(tree.size());
+            for (std::size_t k = 0; k < tree.size(); ++k)
+                build[t][k] = LiveRank(player, tree[k]);
+        }
+        return build;
     }
 }
