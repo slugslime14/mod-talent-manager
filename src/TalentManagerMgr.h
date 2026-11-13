@@ -1,0 +1,119 @@
+#ifndef MOD_TALENT_MANAGER_MGR_H
+#define MOD_TALENT_MANAGER_MGR_H
+
+#include "DatabaseEnvFwd.h"
+#include "Define.h"
+#include "SharedDefines.h"
+#include <array>
+#include <atomic>
+#include <map>
+#include <mutex>
+#include <set>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+class Player;
+
+namespace TalentManager
+{
+    // Protocol version sent in INFO. The addon warns when it doesn't match its own.
+    constexpr uint32 PROTOCOL_VERSION = 4;
+    constexpr std::size_t MAX_NAME_LENGTH = 32;    // characters; talent_manager_spec.name is VARCHAR(32)
+    constexpr uint8 GLYPH_SLOTS = MAX_GLYPH_SLOT_INDEX;
+    constexpr uint8 TALENT_GROUPS = 2;              // dual spec (MAX_TALENT_SPECS)
+
+    struct Spec
+    {
+        uint32 id = 0;          // per character
+        uint32 sort = 0;        // list order
+        std::string name;
+        std::string talents;    // talent calculator link, shortest form (Talents::Encode)
+        std::array<uint32, GLYPH_SLOTS> glyphs{};   // GlyphProperties.dbc ids by socket, 0 = empty
+    };
+
+    // One character's saved specs, kept in memory while the character is online.
+    struct Profile
+    {
+        std::map<uint32, Spec> specs;
+        std::array<uint32, TALENT_GROUPS> loaded{};    // the spec last loaded into each talent group, 0 = none
+        std::set<uint32> known;                         // glyphs the character has had in a socket
+    };
+
+    // A spec load waiting for its swap cast to finish.
+    struct Swap
+    {
+        uint32 specId = 0;
+        uint32 remaining = 0;   // ms
+        uint32 mapId = 0;
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+    };
+
+    class Mgr
+    {
+    public:
+        static Mgr& Instance();
+
+        // Random bot accounts never use the talent manager.
+        static bool IsUser(Player* player);
+
+        void OnStartup();
+        void OnLogin(Player* player);
+        void OnLogout(Player* player);
+        void OnDeleteFromDB(CharacterDatabaseTransaction trans, uint32 guid);
+
+        // Runs a pending swap cast: cancels it on combat, moving or death, loads the spec when it ends.
+        void OnUpdate(Player* player, uint32 diff);
+
+        // `body` is "CMD:payload", the text after the TMGR envelope.
+        void HandleAddonMessage(Player* player, std::string const& body);
+
+    private:
+        Profile& GetProfile(Player* player);
+
+        void SendInfo(Player* player);
+        void SendSpecs(Player* player);
+
+        void HandleSave(Player* player, std::string_view payload);
+        void HandleRename(Player* player, std::string_view payload);
+        void HandleDelete(Player* player, std::string_view payload);
+        void HandleLoad(Player* player, std::string_view payload);
+
+        // Known glyphs: everything ever in a socket, and anything a load inscribed from the bags.
+        void SendGlyphs(Player* player);
+        // Adds the active talent group's glyphs to the known list. True when one was new.
+        bool LearnSocketedGlyphs(Player* player, Profile& profile);
+        void AddKnown(Player* player, Profile& profile, uint32 glyphId);
+
+        // TalentManagerLoad.cpp. All of these run with _lock held.
+        // Why the player can't change talents now, or empty when they can.
+        std::string LoadBlocker(Player* player);
+        // Why a running swap cast stops, or empty while it goes on.
+        std::string SwapInterrupt(Player* player, Swap const& swap);
+        void CancelSwap(Player* player, std::string_view reason);
+        // Checks the spec once more and puts it on the player: talents, then glyphs (action bars in phase 5).
+        void FinishLoad(Player* player, uint32 specId);
+        // Puts the spec's glyphs in their sockets. Glyphs that can't go in are added to `skipped`, glyphs inscribed
+        // from an item in the bags to `used`.
+        void ApplyGlyphs(Player* player, Profile& profile, Spec const& spec, std::vector<uint32>& skipped,
+            std::vector<uint32>& used);
+        void MarkLoaded(Player* player, Profile& profile, uint32 specId);
+
+        // Checks a spec name: length, no protocol separators, not used by another spec of this character.
+        bool CheckName(Player* player, Profile const& profile, std::string const& name, uint32 exceptId);
+
+        void SaveSpec(Player* player, Spec const& spec);
+
+        // Addon messages arrive on the world thread, swap casts finish in map update threads (several run at once),
+        // so everything below is used under _lock.
+        std::mutex _lock;
+        std::unordered_map<uint32, Profile> _profiles;  // by character guid (low)
+        std::unordered_map<uint32, Swap> _swaps;        // by character guid (low)
+        std::atomic<uint32> _swapCount{0};              // _swaps.size(), read without the lock on every player update
+    };
+}
+
+#endif

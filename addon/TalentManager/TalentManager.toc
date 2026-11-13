@@ -1,0 +1,12 @@
+## Interface: 30300
+## Title: TalentManager
+## Notes: Saved talent specs with glyphs and action bars (mod-talent-manager). /tm to open.
+## Author: mod-talent-manager
+## Version: 0.4
+## SavedVariablesPerCharacter: TalentManagerDB
+
+TalentManager.lua
+TalentManagerUI.lua
+TalentManagerSpecs.lua
+TalentManagerGlyphs.lua
+TalentManagerCast.lua

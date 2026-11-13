@@ -1,0 +1,36 @@
+[worldserver]
+
+###################################################################################################
+#    MOD TALENT MANAGER
+#
+#    Saved talent specs per character, with their glyphs and action bars. Pair it with the
+#    TalentManager client addon (modules/mod-talent-manager/addon/TalentManager).
+###################################################################################################
+
+#
+#    TalentManager.Enable
+#        Description: Enable the talent manager.
+#        Default:     1 (Enabled)
+#                     0 (Disabled)
+#
+
+TalentManager.Enable = 1
+
+#
+#    TalentManager.SwapCastTime
+#        Description: Time in milliseconds it takes to load a saved spec that removes or moves
+#                     talent points. Combat, moving or dying cancels it. A load that only adds
+#                     points is always instant.
+#        Default:     5000
+#                     0    (Instant)
+#
+
+TalentManager.SwapCastTime = 5000
+
+#
+#    TalentManager.MaxSpecs
+#        Description: Maximum number of saved specs per character.
+#        Default:     20
+#
+
+TalentManager.MaxSpecs = 20
